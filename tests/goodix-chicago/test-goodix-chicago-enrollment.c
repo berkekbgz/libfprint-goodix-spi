@@ -1181,8 +1181,9 @@ test_second_insert_identity (void)
   memset (metric_data.coarse_mask, 0xff,
           sizeof (metric_data.coarse_mask));
   memset (metric_data.primary, 0xff, 40);
-  memset (metric_data.position_map, 0xff,
-          sizeof (metric_data.position_map));
+  for (guint index = 0; index < G_N_ELEMENTS (metric_data.position_map);
+       index++)
+    metric_data.position_map[index] = 0xff;
   for (guint index = 0; index < G_N_ELEMENTS (records); index++)
     {
       records[index].refined_x = 0x1000 + (index % 4) * 0x400;
@@ -1244,8 +1245,9 @@ test_repeated_eight_insertions (void)
   memset (metric_data.primary, 0xff, 40);
   memset (metric_data.coarse_mask, 0xff,
           sizeof (metric_data.coarse_mask));
-  memset (metric_data.position_map, 0xff,
-          sizeof (metric_data.position_map));
+  for (guint index = 0; index < G_N_ELEMENTS (metric_data.position_map);
+       index++)
+    metric_data.position_map[index] = 0xff;
   for (guint index = 0; index < G_N_ELEMENTS (records); index++)
     {
       records[index].refined_x = 0x1000 + (index % 4) * 0x400;
