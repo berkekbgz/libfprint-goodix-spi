@@ -1168,6 +1168,19 @@ test_relation_builder_identity (void)
 }
 
 static void
+init_identity_metric_fixture (GoodixChicagoMetricData *metric_data)
+{
+  for (guint index = 0; index < 40; index++)
+    metric_data->primary[index] = 0xff;
+  for (guint index = 0; index < G_N_ELEMENTS (metric_data->coarse_mask);
+       index++)
+    metric_data->coarse_mask[index] = 0xff;
+  for (guint index = 0; index < G_N_ELEMENTS (metric_data->position_map);
+       index++)
+    metric_data->position_map[index] = 0xff;
+}
+
+static void
 test_second_insert_identity (void)
 {
   g_autoptr(GoodixChicagoEnrollment) enrollment =
@@ -1178,12 +1191,7 @@ test_second_insert_identity (void)
   GoodixChicagoRelation relation;
   g_autoptr(GError) error = NULL;
 
-  memset (metric_data.coarse_mask, 0xff,
-          sizeof (metric_data.coarse_mask));
-  memset (metric_data.primary, 0xff, 40);
-  for (guint index = 0; index < G_N_ELEMENTS (metric_data.position_map);
-       index++)
-    metric_data.position_map[index] = 0xff;
+  init_identity_metric_fixture (&metric_data);
   for (guint index = 0; index < G_N_ELEMENTS (records); index++)
     {
       records[index].refined_x = 0x1000 + (index % 4) * 0x400;
@@ -1242,12 +1250,7 @@ test_repeated_eight_insertions (void)
   GoodixChicagoEnrollmentResult result;
   g_autoptr(GError) error = NULL;
 
-  memset (metric_data.primary, 0xff, 40);
-  memset (metric_data.coarse_mask, 0xff,
-          sizeof (metric_data.coarse_mask));
-  for (guint index = 0; index < G_N_ELEMENTS (metric_data.position_map);
-       index++)
-    metric_data.position_map[index] = 0xff;
+  init_identity_metric_fixture (&metric_data);
   for (guint index = 0; index < G_N_ELEMENTS (records); index++)
     {
       records[index].refined_x = 0x1000 + (index % 4) * 0x400;
