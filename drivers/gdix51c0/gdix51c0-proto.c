@@ -209,12 +209,25 @@ gdix51c0_spi_read_typed (FpDevice *dev, int spi_fd,
                hdr[0], hdr[1], hdr[2], hdr[3]);
     }
 
+  /* g_malloc (0) returns NULL, which every caller treats as a failure and
+   * then reads error->message.  A corrupted header such as 00 00 00 a0 gets
+   * here, so report it instead of returning NULL with no error set. */
+  if (length == 0)
+    {
+      g_set_error (error,
+                   G_IO_ERROR,
+                   G_IO_ERROR_INVALID_DATA,
+                   "gdix51c0: read returned zero-length header "
+                   "(%02x %02x %02x %02x)",
+                   hdr[0], hdr[1], hdr[2], hdr[3]);
+      return NULL;
+    }
+
   /* ACK and response packets may be queued back-to-back in one IRQ-high
    * window. Read exactly the advertised length so this transfer cannot consume
    * the following packet's header. */
   guint8 *payload = g_malloc (length);
-  if (length > 0 &&
-      !gdix51c0_spi_xfer_read (spi_fd, payload, length, error))
+  if (!gdix51c0_spi_xfer_read (spi_fd, payload, length, error))
     {
       g_free (payload);
       return NULL;

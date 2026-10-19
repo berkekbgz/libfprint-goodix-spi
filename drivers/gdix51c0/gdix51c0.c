@@ -464,8 +464,15 @@ gdix51c0_open_thread (gpointer user_data)
 
   complete->dev = g_object_ref (open_thread->dev);
   if (!gdix51c0_session_activate (self, &complete->error))
-    fp_warn ("gdix51c0: background warm activation failed: %s",
-             complete->error ? complete->error->message : "?");
+    {
+      /* open_complete_main decides success from the error alone; a failure
+       * without one would be reported as a ready warm session. */
+      if (!complete->error)
+        g_set_error_literal (&complete->error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                             "gdix51c0: warm activation failed without an error");
+      fp_warn ("gdix51c0: background warm activation failed: %s",
+               complete->error->message);
+    }
 
   g_main_context_invoke_full (
     open_thread->context,
@@ -1441,7 +1448,8 @@ gdix51c0_session_tls_start (FpiDeviceGdix51c0 *self,
   {
     g_autoptr(GError) rec_err = NULL;
     if (!gdix51c0_recover_psk_from_mcu (&bus, mcu_psk, &mcu_present, &rec_err))
-      fp_info ("gdix51c0: sensor PSK recovery unavailable: %s", rec_err->message);
+      fp_info ("gdix51c0: sensor PSK recovery unavailable: %s",
+               rec_err ? rec_err->message : "?");
   }
 
   /* Select the PSK for this session: just-provisioned > env/persisted >
