@@ -57,6 +57,22 @@ guint8 *gdix51c0_spi_read_typed (FpDevice *dev, int spi_fd,
                                  guint8 *out_type,
                                  gsize *out_len, GError **error);
 
+/* Single-attempt read used by the listener's IRQ-low polling fallback.
+ * Returns the payload when a well-formed packet header is on the bus.
+ * Returns NULL with *out_len = 0 and no error when the bus is idle
+ * (all-zero / all-FF header) or the header checksum fails; returns NULL
+ * with an error only on a transfer failure. */
+guint8 *gdix51c0_spi_peek_packet (int spi_fd,
+                                  guint8 *out_type,
+                                  gsize *out_len,
+                                  GError **error);
+
+/* Enable the IRQ-low polling fallback for the synchronous command path on
+ * @spi_fd (pass -1 to disable, e.g. while the async listener owns the bus).
+ * gdix51c0_irq_wait() then peeks the bus between short waits and parks any
+ * reply it finds; the next gdix51c0_spi_read_typed() on that fd returns it. */
+void gdix51c0_irq_poll_set_fd (int spi_fd);
+
 /* ---- IRQ + reset ------------------------------------------------- */
 /*
  * Wait for an edge event of the given direction on the IRQ line.

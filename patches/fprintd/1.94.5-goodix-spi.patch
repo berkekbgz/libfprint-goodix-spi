@@ -1,5 +1,5 @@
 diff --git a/src/device.c b/src/device.c
-index 4de4a10..eb4b73d 100644
+index 4de4a10..7e51777 100644
 --- a/src/device.c
 +++ b/src/device.c
 @@ -113,12 +113,16 @@ typedef struct
@@ -196,7 +196,7 @@ index 4de4a10..eb4b73d 100644
    fp_device_suspend (priv->dev, NULL, suspend_cb, task);
  }
 
-@@ -532,6 +669,18 @@ fprint_device_resume (FprintDevice       *rdev,
+@@ -532,6 +669,31 @@ fprint_device_resume (FprintDevice       *rdev,
    /* Just forward to libfprint. */
 
    task = g_task_new (rdev, NULL, callback, user_data);
@@ -204,6 +204,19 @@ index 4de4a10..eb4b73d 100644
 +  if (priv->keep_warm && priv->warm_closed_for_sleep)
 +    {
 +      priv->warm_closed_for_sleep = FALSE;
++
++      /* A client (typically the lock screen) can Claim between wake-up and
++       * this resume notification. Its open is already in flight or done;
++       * a second open would fail and that error would be returned to the
++       * pending Claim, so the client would drop fingerprint auth. */
++      if (priv->current_action == ACTION_OPEN || fp_device_is_open (priv->dev))
++        {
++          g_message ("Skipping post-resume warm open; a claim already opened the device");
++          g_task_return_boolean (task, TRUE);
++          g_object_unref (task);
++          return;
++        }
++
 +      priv->current_action = ACTION_OPEN;
 +      fp_device_open (priv->dev, NULL, warm_resume_open_cb, task);
 +      return;
@@ -215,7 +228,7 @@ index 4de4a10..eb4b73d 100644
    fp_device_resume (priv->dev, NULL, resume_cb, task);
  }
 
-@@ -992,7 +1141,8 @@ _fprint_device_client_vanished (GDBusConnection *connection,
+@@ -992,7 +1154,8 @@ _fprint_device_client_vanished (GDBusConnection *connection,
         * was already closing. */
        g_clear_pointer (&session, session_data_unref);
        session = session_data_get (priv);
@@ -225,7 +238,57 @@ index 4de4a10..eb4b73d 100644
          g_critical ("Error closing device after disconnect: %s", error->message);
 
        session_data_set_new (priv, NULL, NULL);
-@@ -1120,6 +1270,20 @@ fprint_device_claim (FprintDBusDevice      *dbus_dev,
+@@ -1024,6 +1187,17 @@ _fprint_device_add_client (FprintDevice *rdev, const char *sender)
+     }
+ }
+
++static void
++abandoned_open_close_cb (FpDevice *dev, GAsyncResult *res, void *user_data)
++{
++  g_autoptr(GError) error = NULL;
++  g_autoptr(FprintDeviceActionUnset) action_unset = user_data;
++
++  if (!fp_device_close_finish (dev, res, &error))
++    g_warning ("Failed to close device after abandoned claim: %s",
++               error->message);
++}
++
+ static void
+ dev_open_cb (FpDevice *dev, GAsyncResult *res, void *user_data)
+ {
+@@ -1037,6 +1211,31 @@ dev_open_cb (FpDevice *dev, GAsyncResult *res, void *user_data)
+
+   action_unset = rdev;
+   session = session_data_get (priv);
++
++  /* The claim that started this open can be gone by the time it finishes:
++   * the client released or vanished (e.g. a lock screen restarting its PAM
++   * conversation after resume), or the post-resume warm open already
++   * completed it. Finish the open without touching a missing invocation. */
++  if (!session || !session->invocation)
++    {
++      if (!fp_device_open_finish (dev, res, &error))
++        {
++          g_message ("Open for abandoned claim failed: %s", error->message);
++          return;
++        }
++
++      g_message ("Open finished after its claim was abandoned on device %d",
++                 priv->id);
++      if (!priv->keep_warm)
++        {
++          priv->current_action = ACTION_CLOSE;
++          fp_device_close (dev, NULL,
++                           (GAsyncReadyCallback) abandoned_open_close_cb,
++                           g_steal_pointer (&action_unset));
++        }
++      return;
++    }
++
+   invocation = g_steal_pointer (&session->invocation);
+
+   if (!fp_device_open_finish (dev, res, &error))
+@@ -1120,6 +1319,20 @@ fprint_device_claim (FprintDBusDevice      *dbus_dev,
 
    g_debug ("user '%s' claiming the device: %d", session->username, priv->id);
 
@@ -246,7 +309,7 @@ index 4de4a10..eb4b73d 100644
    priv->current_action = ACTION_OPEN;
    fp_device_open (priv->dev, NULL, (GAsyncReadyCallback) dev_open_cb, rdev);
 
-@@ -1198,6 +1362,14 @@ fprint_device_release (FprintDBusDevice      *dbus_dev,
+@@ -1198,6 +1411,14 @@ fprint_device_release (FprintDBusDevice      *dbus_dev,
        return TRUE;
      }
 
@@ -261,7 +324,7 @@ index 4de4a10..eb4b73d 100644
    session->invocation = g_object_ref (invocation);
 
    priv->current_action = ACTION_CLOSE;
-@@ -1535,6 +1707,65 @@ stoppable_action_stop (FprintDevice          *rdev,
+@@ -1535,6 +1756,65 @@ stoppable_action_stop (FprintDevice          *rdev,
      stoppable_action_completed (rdev);
  }
 
@@ -327,7 +390,7 @@ index 4de4a10..eb4b73d 100644
  static void
  match_cb (FpDevice *device,
            FpPrint  *match,
-@@ -1552,6 +1783,9 @@ match_cb (FpDevice *device,
+@@ -1552,6 +1832,9 @@ match_cb (FpDevice *device,
    cancelled = g_cancellable_is_cancelled (priv->current_cancellable);
    matched = match != NULL && cancelled == FALSE;
 
@@ -337,7 +400,7 @@ index 4de4a10..eb4b73d 100644
    report_verify_status (rdev, matched, error);
  }
 
-@@ -1584,6 +1818,7 @@ verify_cb (FpDevice *dev, GAsyncResult *res, void *user_data)
+@@ -1584,6 +1867,7 @@ verify_cb (FpDevice *dev, GAsyncResult *res, void *user_data)
    else
      {
        g_clear_object (&priv->verify_data);
@@ -345,7 +408,7 @@ index 4de4a10..eb4b73d 100644
 
        if (error)
          {
-@@ -1629,6 +1864,7 @@ identify_cb (FpDevice *dev, GAsyncResult *res, void *user_data)
+@@ -1629,6 +1913,7 @@ identify_cb (FpDevice *dev, GAsyncResult *res, void *user_data)
    else
      {
        g_clear_pointer (&priv->identify_data, g_ptr_array_unref);
@@ -353,7 +416,7 @@ index 4de4a10..eb4b73d 100644
 
        if (error)
          {
-@@ -1713,6 +1949,9 @@ fprint_device_verify_start (FprintDBusDevice      *dbus_dev,
+@@ -1713,6 +1998,9 @@ fprint_device_verify_start (FprintDBusDevice      *dbus_dev,
        g_debug ("start identification device %d", priv->id);
        priv->current_cancellable = g_cancellable_new ();
        priv->identify_data = g_ptr_array_ref (gallery);
@@ -363,7 +426,7 @@ index 4de4a10..eb4b73d 100644
        fp_device_identify (priv->dev, gallery, priv->current_cancellable,
                            match_cb, rdev, NULL,
                            (GAsyncReadyCallback) identify_cb, rdev);
-@@ -1748,6 +1987,8 @@ fprint_device_verify_start (FprintDBusDevice      *dbus_dev,
+@@ -1748,6 +2036,8 @@ fprint_device_verify_start (FprintDBusDevice      *dbus_dev,
        priv->current_action = ACTION_VERIFY;
        priv->current_cancellable = g_cancellable_new ();
        priv->verify_data = g_object_ref (print);

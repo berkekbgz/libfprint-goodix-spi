@@ -431,6 +431,8 @@ gdix51c0_open_complete_main (gpointer user_data)
       /* The activation loop has already reset every failed session. Release
        * the host handles so a later Claim can retry open from a clean state. */
       g_clear_pointer (&self->listener, gdix51c0_listener_free);
+      if (self->spi_fd >= 0)
+        gdix51c0_irq_poll_set_fd (self->spi_fd);
       if (self->tls_ready)
         {
           gdix51c0_tls_free (&self->tls);
@@ -441,6 +443,7 @@ gdix51c0_open_complete_main (gpointer user_data)
       g_clear_pointer (&self->chicago_calibration, g_bytes_unref);
       if (self->spi_fd >= 0)
         {
+          gdix51c0_irq_poll_set_fd (-1);
           close (self->spi_fd);
           self->spi_fd = -1;
         }
@@ -527,8 +530,9 @@ gdix51c0_open (FpDevice *dev)
    * whatever the kernel set the fd to.  GDIX51C0_SPI_SPEED_HZ env lets us sweep
    * the bus clock — some Chicago parts derive the internal readout clock from
    * SPI, so this is the last knob for the 0x0b78 readout cliff. */
-  guint32 speed = (guint32) GDIX51C0_DEV_ENV_INT ("GDIX51C0_SPI_SPEED_HZ",
-                                                  GDIX51C0_SPI_SPEED_HZ);
+  /* Runtime knob (also in release builds): some boards need a slower bus. */
+  guint32 speed = (guint32) gdix51c0_env_int ("GDIX51C0_SPI_SPEED_HZ",
+                                              GDIX51C0_SPI_SPEED_HZ);
   fp_dbg ("gdix51c0: SPI speed = %u Hz", speed);
   guint8  mode  = GDIX51C0_SPI_MODE;
   guint8  bpw   = 8;
@@ -538,6 +542,7 @@ gdix51c0_open (FpDevice *dev)
     {
       g_set_error (&err, G_IO_ERROR, g_io_error_from_errno (errno),
                    "gdix51c0: spidev configure failed");
+      gdix51c0_irq_poll_set_fd (-1);
       close (self->spi_fd);
       self->spi_fd = -1;
       fpi_device_open_complete (dev, err);
@@ -552,9 +557,11 @@ gdix51c0_open (FpDevice *dev)
   ioctl (self->spi_fd, SPI_IOC_RD_BITS_PER_WORD, &actual_bpw);
   fp_dbg ("gdix51c0: spidev configured: speed=%u Hz mode=0x%02x bpw=%u",
           actual_speed, actual_mode, actual_bpw);
+  gdix51c0_irq_poll_set_fd (self->spi_fd);
 
   if (!gdix51c0_open_gpios (self, &err))
     {
+      gdix51c0_irq_poll_set_fd (-1);
       close (self->spi_fd);
       self->spi_fd = -1;
       gdix51c0_close_gpios (self);
@@ -594,6 +601,7 @@ gdix51c0_open (FpDevice *dev)
             gdix51c0_open_thread_free (open_thread);
             g_clear_pointer (&self->action_context, g_main_context_unref);
             g_clear_object (&self->action_cancellable);
+            gdix51c0_irq_poll_set_fd (-1);
             close (self->spi_fd);
             self->spi_fd = -1;
             gdix51c0_close_gpios (self);
@@ -620,6 +628,8 @@ gdix51c0_close (FpDevice *dev)
    * still running.  Stop it first so we don't release the IRQ line out from
    * underneath the reader thread. */
   g_clear_pointer (&self->listener, gdix51c0_listener_free);
+  if (self->spi_fd >= 0)
+    gdix51c0_irq_poll_set_fd (self->spi_fd);
 
   if (self->tls_ready)
     {
@@ -633,6 +643,7 @@ gdix51c0_close (FpDevice *dev)
 
   if (self->spi_fd >= 0)
     {
+      gdix51c0_irq_poll_set_fd (-1);
       close (self->spi_fd);
       self->spi_fd = -1;
     }
@@ -2006,6 +2017,7 @@ gdix51c0_session_activate_once (FpiDeviceGdix51c0 *self, GError **error)
    * gdix51c0_spi_read directly. */
   g_assert (self->listener == NULL);
   gdix51c0_irq_drain (self->irq_req, self->irq_events);
+  gdix51c0_irq_poll_set_fd (-1);   /* the listener owns the bus now */
   self->listener = gdix51c0_listener_new (FP_DEVICE (self),
                                           self->spi_fd,
                                           self->irq_req,
@@ -2130,6 +2142,8 @@ gdix51c0_session_deactivate (FpiDeviceGdix51c0 *self)
    * listener's reader thread may currently hold the SPI mutex and we must not
    * race it for the IRQ line. */
   g_clear_pointer (&self->listener, gdix51c0_listener_free);
+  if (self->spi_fd >= 0)
+    gdix51c0_irq_poll_set_fd (self->spi_fd);
 
   if (self->tls_ready)
     {
@@ -3393,10 +3407,21 @@ gdix51c0_capture_image_raw (FpiDeviceGdix51c0 *self,
        * Suppress ALL listener SPI access for the readout duration, then release
        * it so the finished image is picked up on the next poll. */
       {
-        guint settle_ms = (guint) GDIX51C0_DEV_ENV_INT (
-          "GDIX51C0_CAPTURE_SETTLE_MS", 80);
+        /* Runtime knob.  The reference unit signals the frame ~73 ms after
+         * the ACK; the MateBook 16s 2023 needs ~100 ms, and any bus traffic
+         * before that (including the listener's IRQ-low peeks) can kill the
+         * frame.  Default 130 ms leaves margin. */
+        guint settle_ms = (guint) gdix51c0_env_int (
+          "GDIX51C0_CAPTURE_SETTLE_MS", 60);
+        /* After the fully quiet window the listener reads only when IRQ
+         * reports the frame; bus peeks (IRQ-low fallback) stay held off for
+         * this much longer, because the sensor withdraws the frame if it is
+         * not collected soon after it is ready (~100 ms on this board). */
+        guint peek_holdoff_ms = (guint) gdix51c0_env_int (
+          "GDIX51C0_CAPTURE_PEEK_HOLDOFF_MS", 80);
         gdix51c0_listener_set_suppress (self->listener, TRUE);
         g_usleep ((gulong) settle_ms * 1000);
+        gdix51c0_listener_hold_peeks (self->listener, peek_holdoff_ms * 1000);
         gdix51c0_listener_set_suppress (self->listener, FALSE);
       }
 

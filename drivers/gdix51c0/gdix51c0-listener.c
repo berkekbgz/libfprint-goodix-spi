@@ -49,6 +49,8 @@ struct Gdix51c0Listener
 
   GThread *thread;
   gint     stop_requested;  /* atomic */
+  gint     awaiting;        /* atomic: callers blocked in listener_await */
+  gint64   peek_holdoff_until_us; /* under dispatch_lock: no bus peeks before this */
   gint     suppress;        /* atomic: when set, the listener does NO SPI reads.
                              * Used during image capture so we stay silent on the
                              * bus (like Windows) while the sensor reads out the
@@ -141,6 +143,57 @@ listener_enqueue_locked (Gdix51c0Listener *self,
   g_queue_push_tail (q, p);
 }
 
+/* Route one packet read off the bus into its per-cmd queue.
+ * Takes ownership of payload. */
+static void
+listener_dispatch (Gdix51c0Listener *self,
+                   guint8            outer_type,
+                   guint8           *payload,
+                   gsize             n)
+{
+    /* Dispatch by payload[0] — that is the inner cmd byte the python
+     * reference and Windows WBDI log call "packet type":
+     *   0xb0 ACK, 0x32 FDT-down, 0x34 FDT-up, 0xae mcu state.
+     * For image data the payload is a raw TLS record so payload[0] is
+     * 0x17 (TLS appdata).  The outer header's type byte is always 0xa0
+     * on this device and does not discriminate packet kinds, so we log
+     * it for debugging but route only on payload[0]. */
+    guint8 kind = payload[0];
+
+#ifdef GOODIX_SPI_DEVELOPER
+    if (kind == GDIX51C0_PKT_READ &&
+        g_atomic_int_compare_and_exchange (&self->fault_drop_ack_armed,
+                                           1, 0))
+      {
+        fp_warn ("gdix51c0: fault injection dropped one ACK packet");
+        g_free (payload);
+        return;
+      }
+#endif
+
+#ifdef GOODIX_SPI_DEVELOPER
+    gint response_fault = g_atomic_int_get (
+      &self->fault_drop_response_kind);
+    if (response_fault == (gint) kind + 1 &&
+        g_atomic_int_compare_and_exchange (
+          &self->fault_drop_response_kind, response_fault, 0))
+      {
+        fp_warn ("gdix51c0: fault injection dropped one response "
+                 "packet kind=0x%02x", kind);
+        g_free (payload);
+        return;
+      }
+#endif
+
+    g_mutex_lock (&self->dispatch_lock);
+    listener_enqueue_locked (self, kind, payload, n);
+    g_cond_broadcast (&self->cond);
+    g_mutex_unlock (&self->dispatch_lock);
+
+    fp_dbg ("gdix51c0: listener received outer=0x%02x kind=0x%02x len=%zu",
+            outer_type, kind, n);
+}
+
 /* Read every pending packet while IRQ stays high.  Holds spi_lock for each
  * read but releases between packets so writers can interleave if the MCU
  * pauses. */
@@ -167,18 +220,25 @@ listener_drain_irq_high (Gdix51c0Listener *self)
       gsize n = 0;
       guint8 outer_type = 0;
       g_autoptr(GError) err = NULL;
-      guint8 *payload = gdix51c0_spi_read_typed (self->dev, self->spi_fd,
-                                                 &outer_type, &n, &err);
+      /* Single header attempt: the retrying read would clock the bus
+       * several times with sleeps in between, which damages an image
+       * readout in progress.  An idle header just means "not yet". */
+      guint8 *payload = gdix51c0_spi_peek_packet (self->spi_fd,
+                                                  &outer_type, &n, &err);
 
       g_mutex_unlock (&self->spi_lock);
 
       if (!payload)
         {
-          fp_dbg ("gdix51c0: listener read failed: %s",
-                  err ? err->message : "?");
-          /* Avoid a tight loop on persistent read failures. */
-          g_usleep (5000);
-          return;
+          if (err)
+            {
+              fp_dbg ("gdix51c0: listener read failed: %s", err->message);
+              g_usleep (5000);
+              return;
+            }
+          /* IRQ high but idle header: back off, re-check level. */
+          g_usleep (3000);
+          continue;
         }
 
       if (n == 0)
@@ -202,48 +262,72 @@ listener_drain_irq_high (Gdix51c0Listener *self)
           continue;
         }
 
-      /* Dispatch by payload[0] — that is the inner cmd byte the python
-       * reference and Windows WBDI log call "packet type":
-       *   0xb0 ACK, 0x32 FDT-down, 0x34 FDT-up, 0xae mcu state.
-       * For image data the payload is a raw TLS record so payload[0] is
-       * 0x17 (TLS appdata).  The outer header's type byte is always 0xa0
-       * on this device and does not discriminate packet kinds, so we log
-       * it for debugging but route only on payload[0]. */
-      guint8 kind = payload[0];
-
-#ifdef GOODIX_SPI_DEVELOPER
-      if (kind == GDIX51C0_PKT_READ &&
-          g_atomic_int_compare_and_exchange (&self->fault_drop_ack_armed,
-                                             1, 0))
-        {
-          fp_warn ("gdix51c0: fault injection dropped one ACK packet");
-          g_free (payload);
-          continue;
-        }
-#endif
-
-#ifdef GOODIX_SPI_DEVELOPER
-      gint response_fault = g_atomic_int_get (
-        &self->fault_drop_response_kind);
-      if (response_fault == (gint) kind + 1 &&
-          g_atomic_int_compare_and_exchange (
-            &self->fault_drop_response_kind, response_fault, 0))
-        {
-          fp_warn ("gdix51c0: fault injection dropped one response "
-                   "packet kind=0x%02x", kind);
-          g_free (payload);
-          continue;
-        }
-#endif
-
-      g_mutex_lock (&self->dispatch_lock);
-      listener_enqueue_locked (self, kind, payload, n);
-      g_cond_broadcast (&self->cond);
-      g_mutex_unlock (&self->dispatch_lock);
-
-      fp_dbg ("gdix51c0: listener received outer=0x%02x kind=0x%02x len=%zu",
-              outer_type, kind, n);
+      listener_dispatch (self, outer_type, payload, n);
     }
+}
+
+/* Some GDIX51C0 boards (seen on a Huawei MateBook 16s 2023, CREFG-XX) leave
+ * a reply ready on the SPI bus without asserting IRQ.  The level-driven loop
+ * above never reads those, so the caller times out even though the packet is
+ * there.  While somebody is blocked in gdix51c0_listener_await, peek the bus
+ * every few milliseconds when IRQ is low.  An idle bus answers with all-zero
+ * or all-FF headers, which the peek ignores. */
+static void
+listener_speculative_read (Gdix51c0Listener *self)
+{
+  static int enabled = -1;
+
+  if (enabled < 0)
+    {
+      const char *v = g_getenv ("GDIX51C0_LISTENER_POLL");
+      enabled = (v && g_strcmp0 (v, "0") == 0) ? 0 : 1;
+    }
+  if (!enabled)
+    return;
+
+  if (g_atomic_int_get (&self->stop_requested) ||
+      g_atomic_int_get (&self->suppress) ||
+      g_atomic_int_get (&self->awaiting) <= 0)
+    return;
+
+  g_mutex_lock (&self->dispatch_lock);
+  gint64 holdoff = self->peek_holdoff_until_us;
+  g_mutex_unlock (&self->dispatch_lock);
+  if (g_get_monotonic_time () < holdoff)
+    return;   /* capture readout window: no bus traffic unless IRQ says ready */
+
+  if (gpiod_line_request_get_value (self->irq_req, self->irq_offset) ==
+      GPIOD_LINE_VALUE_ACTIVE)
+    return;   /* the normal IRQ-high drain handles this */
+
+  g_mutex_lock (&self->spi_lock);
+
+  gsize n = 0;
+  guint8 outer_type = 0;
+  g_autoptr(GError) err = NULL;
+  guint8 *payload = gdix51c0_spi_peek_packet (self->spi_fd, &outer_type,
+                                              &n, &err);
+
+  g_mutex_unlock (&self->spi_lock);
+
+  if (!payload)
+    {
+      if (err)
+        {
+          fp_dbg ("gdix51c0: listener poll read failed: %s", err->message);
+          g_usleep (5000);
+        }
+      return;
+    }
+
+  if (n == 0)
+    {
+      g_free (payload);
+      return;
+    }
+
+  fp_dbg ("gdix51c0: listener fetched a reply with IRQ low (%zu B)", n);
+  listener_dispatch (self, outer_type, payload, n);
 }
 
 static gpointer
@@ -265,7 +349,10 @@ listener_thread_main (gpointer user_data)
 
   while (!g_atomic_int_get (&self->stop_requested))
     {
-      int ready = poll (poll_fds, G_N_ELEMENTS (poll_fds), -1);
+      /* Block indefinitely when idle; poll the bus every 3 ms while a
+       * caller waits for a reply (IRQ-low fallback, see above). */
+      int timeout_ms = g_atomic_int_get (&self->awaiting) > 0 ? 3 : -1;
+      int ready = poll (poll_fds, G_N_ELEMENTS (poll_fds), timeout_ms);
 
       if (g_atomic_int_get (&self->stop_requested))
         break;
@@ -279,12 +366,25 @@ listener_thread_main (gpointer user_data)
           continue;
         }
 
+      if (ready == 0)
+        {
+          /* No new edge.  The level may still be high from an edge that
+           * was consumed while reads were suppressed (image capture), so
+           * drain on level first, then fall back to peeking the bus. */
+          listener_drain_irq_high (self);
+          listener_speculative_read (self);
+          continue;
+        }
+
       if (poll_fds[1].revents & POLLIN)
         {
           uint64_t wake_count;
 
           (void) read (self->wake_fd, &wake_count, sizeof (wake_count));
           poll_fds[1].revents = 0;
+          /* A wake also follows suppress-off and await-start: pick up a
+           * packet whose edge was consumed while we could not read. */
+          listener_drain_irq_high (self);
           continue;
         }
 
@@ -432,6 +532,21 @@ gdix51c0_listener_set_suppress (Gdix51c0Listener *self, gboolean on)
   if (!self)
     return;
   g_atomic_int_set (&self->suppress, on ? 1 : 0);
+  if (!on && self->wake_fd >= 0)
+    {
+      uint64_t wake_count = 1;
+      (void) write (self->wake_fd, &wake_count, sizeof (wake_count));
+    }
+}
+
+void
+gdix51c0_listener_hold_peeks (Gdix51c0Listener *self, guint usec)
+{
+  if (!self)
+    return;
+  g_mutex_lock (&self->dispatch_lock);
+  self->peek_holdoff_until_us = g_get_monotonic_time () + (gint64) usec;
+  g_mutex_unlock (&self->dispatch_lock);
 }
 
 static gboolean
@@ -607,8 +722,8 @@ gdix51c0_listener_command (Gdix51c0Listener *self,
   g_assert_not_reached ();
 }
 
-guint8 *
-gdix51c0_listener_await (Gdix51c0Listener *self,
+static guint8 *
+listener_await_impl (Gdix51c0Listener *self,
                          guint8            cmd,
                          guint             timeout_usec,
                          gsize            *out_len,
@@ -662,4 +777,25 @@ gdix51c0_listener_await (Gdix51c0Listener *self,
       /* g_cond_wait_until takes monotonic microseconds. */
       g_cond_wait_until (&self->cond, &self->dispatch_lock, wait_until_us);
     }
+}
+
+guint8 *
+gdix51c0_listener_await (Gdix51c0Listener *self,
+                         guint8            cmd,
+                         guint             timeout_usec,
+                         gsize            *out_len,
+                         GError          **error)
+{
+  uint64_t wake_count = 1;
+  guint8  *data;
+
+  g_atomic_int_inc (&self->awaiting);
+  /* Kick the listener out of its indefinite poll so it starts the IRQ-low
+   * polling fallback right away. */
+  (void) write (self->wake_fd, &wake_count, sizeof (wake_count));
+
+  data = listener_await_impl (self, cmd, timeout_usec, out_len, error);
+
+  (void) g_atomic_int_dec_and_test (&self->awaiting);
+  return data;
 }

@@ -63,6 +63,11 @@ void gdix51c0_listener_drain_cmd (Gdix51c0Listener *self, guint8 cmd);
  * bus silent during an image capture readout. */
 void gdix51c0_listener_set_suppress (Gdix51c0Listener *self, gboolean on);
 
+/* Do not peek the bus (IRQ-low fallback) for @usec from now; IRQ-high
+ * reads still happen.  Used after an image setmode so the sensor's readout
+ * is not disturbed while a frame that does raise IRQ is still read at once. */
+void gdix51c0_listener_hold_peeks (Gdix51c0Listener *self, guint usec);
+
 /* Send a packet on the SPI bus (outer header type=0xa0, plus payload).
  * Serializes against listener reads via the bus mutex. */
 gboolean gdix51c0_listener_write (Gdix51c0Listener *self,

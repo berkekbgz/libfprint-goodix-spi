@@ -116,6 +116,40 @@ load_device_metadata() {
   }
 }
 
+# A LPSS SPI controller that found no DMA channel at probe (idma64 loaded after
+# it) silently runs in PIO mode, and on some boards that truncates the last bytes
+# of every sensor reply (see issue #8).  Warn, do not fail.
+warn_if_spi_controller_uses_pio() {
+  local device_path="$1" node controller pci chan in_use=0 seen=0
+  node="$(readlink -f "$device_path")"
+  controller="${node%%/spi_master/*}"
+  case "$controller" in
+    */pxa2xx-spi.*) ;;
+    *) return 0 ;;
+  esac
+  pci="$(basename "$(dirname "$controller")")"
+  for chan in /sys/class/dma/dma*chan*; do
+    [ -e "$chan/device" ] || continue
+    [ "$(basename "$(readlink -f "$chan/device")")" = "$pci" ] || continue
+    seen=1
+    if [ "$(cat "$chan/in_use" 2>/dev/null)" = "1" ]; then
+      in_use=1
+    fi
+  done
+  if [ "$seen" -eq 1 ] && [ "$in_use" -eq 0 ]; then
+    cat >&2 <<EOF_PIO
+Warning: the SPI controller behind $device_path ($(basename "$controller"), PCI $pci)
+holds no DMA channel, so it runs in PIO mode. On some boards this truncates the
+last bytes of every sensor reply (empty chip-id/OTP responses, TLS record
+errors). Usually idma64 was loaded after the SPI controller; load it first:
+  echo 'softdep spi_pxa2xx_platform pre: idma64' | sudo tee /etc/modprobe.d/goodix-spi-dma.conf
+  dracut:          echo 'add_drivers+=" idma64 "' | sudo tee /etc/dracut.conf.d/goodix-spi-dma.conf; sudo dracut -f
+  initramfs-tools: echo idma64 | sudo tee -a /etc/initramfs-tools/modules; sudo update-initramfs -u
+Reboot, then check:  journalctl -k -b | grep -i 'using PIO' || echo 'DMA OK'
+EOF_PIO
+  fi
+}
+
 check_hardware() {
   local acpi path found=0
   if [ "$SKIP_HARDWARE_CHECK" = "1" ]; then
@@ -128,6 +162,7 @@ check_hardware() {
       if [ -e "$path" ]; then
         printf 'Hardware check: found %s at %s\n' "$acpi" "$path"
         found=1
+        warn_if_spi_controller_uses_pio "$path"
       fi
     done
   done
@@ -349,8 +384,10 @@ BUILT_LIB="$BUILDDIR/libfprint/libfprint-2.so.2.0.0"
 BUILT_UDEV_RULE="$BUILDDIR/libfprint/70-libfprint-2.rules"
 [ -f "$BUILT_LIB" ] || { printf 'Error: built libfprint was not found.\n' >&2; exit 1; }
 [ -f "$BUILT_UDEV_RULE" ] || { printf 'Error: generated libfprint udev rules were not found.\n' >&2; exit 1; }
+# Accept the already-widened form too: the sed below edits the build output in
+# place, so a re-run without a libfprint rebuild sees acpi:ID:* here.
 for acpi in "${SUPPORTED_ACPI_IDS[@]}"; do
-  grep -Fq "ENV{MODALIAS}==\"acpi:$acpi:\"" "$BUILT_UDEV_RULE" || {
+  grep -Fq -e "ENV{MODALIAS}==\"acpi:$acpi:\"" -e "ENV{MODALIAS}==\"acpi:$acpi:*\"" "$BUILT_UDEV_RULE" || {
     printf 'Error: generated udev rules do not contain supported ACPI id %s.\n' "$acpi" >&2
     exit 1
   }

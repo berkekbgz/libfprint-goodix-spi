@@ -30,6 +30,12 @@
 #include "gdix51c0-proto.h"
 #include "gdix51c0-tls.h"
 
+/* OpenSSL < 3.2 (e.g. Ubuntu 24.04's 3.0.x) does not define this reason code.
+ * Use a value ERR_GET_REASON() can never return so the comparison is inert. */
+#ifndef SSL_R_RECORD_LAYER_FAILURE
+#define SSL_R_RECORD_LAYER_FAILURE (-1)
+#endif
+
 #define GDIX51C0_PSK_IDENTITY "Client_identity"
 
 /* ---------------- Custom BIO ---------------- */

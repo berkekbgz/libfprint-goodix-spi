@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -89,6 +90,22 @@ gdix51c0_spi_write (FpDevice *dev, int spi_fd,
     }
   if (payload_len == 0)
     return TRUE;
+  /* Gap between the header and payload CS cycles.  The Windows driver's
+   * SPI trace shows 3-18 ms (median 14 ms) here and never back-to-back;
+   * the python reference sleeps 2 ms.  Back-to-back writes make some
+   * boards (MateBook 16s 2023) silently drop the command.
+   * GDIX51C0_WRITE_GAP_US overrides (0 = none). */
+  {
+    static int gap = -1;
+    if (gap < 0)
+      {
+        const char *v = g_getenv ("GDIX51C0_WRITE_GAP_US");
+        gap = (v && *v) ? (int) g_ascii_strtoll (v, NULL, 0) : 10000;
+        if (gap < 0) gap = 0;
+      }
+    if (gap > 0)
+      g_usleep (gap);
+  }
   n = write (spi_fd, payload, payload_len);
   if ((gsize) n != payload_len)
     {
@@ -109,7 +126,30 @@ gdix51c0_spi_xfer_read (int spi_fd,
 
   while (done < len)
     {
-      gsize chunk = MIN (len - done, (gsize) 2048);
+      /* Per-transfer chunk.  spidev caps a transfer at its bufsiz module
+       * parameter (4096 by default); Windows reads a whole 7.7 KB frame in
+       * one transaction.  GDIX51C0_READ_CHUNK overrides (default 2048). */
+      static gsize chunk_max = 0;
+      if (chunk_max == 0)
+        {
+          const char *v = g_getenv ("GDIX51C0_READ_CHUNK");
+          gint64 n = (v && *v) ? g_ascii_strtoll (v, NULL, 0) : 0;
+          if (n >= 64 && n <= 65536)
+            chunk_max = (gsize) n;
+          else
+            {
+              /* Default: as large as spidev allows, up to 8 KB, so a whole
+               * 7.7 KB frame goes in one transaction when bufsiz permits. */
+              g_autofree gchar *buf = NULL;
+              gint64 bufsiz = 4096;
+              if (g_file_get_contents ("/sys/module/spidev/parameters/bufsiz",
+                                       &buf, NULL, NULL))
+                bufsiz = g_ascii_strtoll (buf, NULL, 10);
+              if (bufsiz < 64) bufsiz = 4096;
+              chunk_max = (gsize) MIN (bufsiz, 8192);
+            }
+        }
+      gsize chunk = MIN (len - done, chunk_max);
       g_autofree guint8 *tx = g_malloc (chunk);
 
       memset (tx, 0xff, chunk);
@@ -188,6 +228,8 @@ gdix51c0_spi_read (FpDevice *dev, int spi_fd, gsize *out_len, GError **error)
   return gdix51c0_spi_read_typed (dev, spi_fd, NULL, out_len, error);
 }
 
+static guint8 *gdix51c0_irq_poll_take (int spi_fd, guint8 *out_type, gsize *out_len);
+
 guint8 *
 gdix51c0_spi_read_typed (FpDevice *dev, int spi_fd,
                          guint8 *out_type,
@@ -200,6 +242,12 @@ gdix51c0_spi_read_typed (FpDevice *dev, int spi_fd,
    * frames look like noise even when the command sequence is correct.
    */
   (void) dev;
+
+  {
+    guint8 *parked = gdix51c0_irq_poll_take (spi_fd, out_type, out_len);
+    if (parked)
+      return parked;
+  }
 
   guint8 hdr[4];
   gboolean saw_all_zero = FALSE;
@@ -292,6 +340,22 @@ gdix51c0_spi_read_typed (FpDevice *dev, int spi_fd,
       return NULL;
     }
 
+  /* Optional gap between the header and payload CS cycles (GDIX51C0_READ_GAP_US,
+   * default 1500).  Windows shows ~1 ms here; 1.5 ms measured best on the
+   * MateBook 16s 2023.  Some boards return an all-zero payload when it is read
+   * back-to-back with the header. */
+  {
+    static int gap = -1;
+    if (gap < 0)
+      {
+        const char *v = g_getenv ("GDIX51C0_READ_GAP_US");
+        gap = (v && *v) ? (int) g_ascii_strtoll (v, NULL, 0) : 1500;
+        if (gap < 0) gap = 0;
+      }
+    if (gap > 0)
+      g_usleep (gap);
+  }
+
   /* ACK and response packets may be queued back-to-back in one IRQ-high
    * window. Read exactly the advertised length so this transfer cannot consume
    * the following packet's header. */
@@ -308,6 +372,172 @@ gdix51c0_spi_read_typed (FpDevice *dev, int spi_fd,
   if (out_type)
     *out_type = hdr[0];
 
+  return payload;
+}
+
+guint8 *
+gdix51c0_spi_peek_packet (int spi_fd,
+                          guint8 *out_type,
+                          gsize *out_len,
+                          GError **error)
+{
+  guint8 hdr[4];
+
+  if (out_len)
+    *out_len = 0;
+
+  if (!gdix51c0_spi_xfer_read (spi_fd, hdr, sizeof (hdr), error))
+    return NULL;
+
+  gboolean all_zero = hdr[0] == 0 && hdr[1] == 0 && hdr[2] == 0 && hdr[3] == 0;
+  gboolean all_ff   = hdr[0] == 0xff && hdr[1] == 0xff &&
+                      hdr[2] == 0xff && hdr[3] == 0xff;
+  guint16  length   = (guint16) hdr[1] | ((guint16) hdr[2] << 8);
+
+  if (all_zero || all_ff || length == 0xffff)
+    return NULL;                      /* idle bus */
+
+  if (!gdix51c0_header_checksum_ok (hdr))
+    {
+      fp_dbg ("gdix51c0: poll peek ignored header with bad checksum "
+              "(%02x %02x %02x %02x)", hdr[0], hdr[1], hdr[2], hdr[3]);
+      return NULL;
+    }
+
+  guint8 *payload = g_malloc (length > 0 ? length : 1);
+
+  if (length > 0 &&
+      !gdix51c0_spi_xfer_read (spi_fd, payload, length, error))
+    {
+      g_free (payload);
+      return NULL;
+    }
+
+  if (out_len)
+    *out_len = length;
+  if (out_type)
+    *out_type = hdr[0];
+
+  return payload;
+}
+
+/* ---- IRQ-low polling fallback for the synchronous path ----------------
+ *
+ * Some boards (Huawei MateBook 16s 2023, CREFG-XX) leave a reply on the bus
+ * without asserting IRQ.  While the sync path waits for a rise, peek the bus
+ * every few ms; a packet found that way is parked here and handed back by the
+ * next gdix51c0_spi_read_typed() on the same fd.  Disabled (fd = -1) while the
+ * async listener owns the bus, which has its own fallback. */
+#define GDIX51C0_IRQ_POLL_SLICE_USEC 3000
+
+/* Runtime tuning knobs (environment), read once:
+ *   GDIX51C0_SYNC_POLL=0            disable the sync-path IRQ-low peek
+ *   GDIX51C0_SYNC_POLL_MIN_WAIT_US  quiet time after a command before peeking (default 20000)
+ *   GDIX51C0_CMD_SPACING_US         pre-send delay between commands (default 1000) */
+static int
+gdix51c0_tune_int (const char *name, int fallback)
+{
+  const char *v = g_getenv (name);
+  char *end = NULL;
+  long  n;
+
+  if (!v || !*v)
+    return fallback;
+  n = strtol (v, &end, 0);
+  if (end == v || *end != '\0')
+    return fallback;
+  return (int) n;
+}
+
+static int
+gdix51c0_tune_cached (const char *name, int fallback, int *cache)
+{
+  if (*cache == -2)
+    *cache = gdix51c0_tune_int (name, fallback);
+  return *cache;
+}
+
+static GMutex  irq_poll_lock;
+static int     irq_poll_fd = -1;
+static guint8 *irq_poll_pushback;
+static gsize   irq_poll_pushback_len;
+static guint8  irq_poll_pushback_type;
+static int     irq_poll_pushback_fd = -1;
+
+void
+gdix51c0_irq_poll_set_fd (int spi_fd)
+{
+  g_mutex_lock (&irq_poll_lock);
+  irq_poll_fd = spi_fd;
+  if (spi_fd < 0 || irq_poll_pushback_fd != spi_fd)
+    {
+      g_clear_pointer (&irq_poll_pushback, g_free);
+      irq_poll_pushback_len = 0;
+      irq_poll_pushback_fd = -1;
+    }
+  g_mutex_unlock (&irq_poll_lock);
+}
+
+/* Returns TRUE when a reply was found on the bus and parked. */
+static gboolean
+gdix51c0_irq_poll_peek (const char *label, gint64 waited_usec)
+{
+  static int enabled = -2, min_wait = -2;
+  gboolean found = FALSE;
+
+  if (!gdix51c0_tune_cached ("GDIX51C0_SYNC_POLL", 1, &enabled))
+    return FALSE;
+  if (waited_usec < gdix51c0_tune_cached ("GDIX51C0_SYNC_POLL_MIN_WAIT_US", 20000, &min_wait))
+    return FALSE;
+
+  g_mutex_lock (&irq_poll_lock);
+
+  if (irq_poll_fd >= 0 && irq_poll_pushback == NULL)
+    {
+      gsize n = 0;
+      guint8 type = 0;
+      g_autoptr(GError) err = NULL;
+      guint8 *payload = gdix51c0_spi_peek_packet (irq_poll_fd, &type, &n, &err);
+
+      if (payload && n > 0)
+        {
+          irq_poll_pushback      = payload;
+          irq_poll_pushback_len  = n;
+          irq_poll_pushback_type = type;
+          irq_poll_pushback_fd   = irq_poll_fd;
+          found = TRUE;
+          fp_dbg ("gdix51c0: %s: reply present with IRQ low after "
+                   "%" G_GINT64_FORMAT " us (%zu B)", label, waited_usec, n);
+        }
+      else
+        {
+          g_free (payload);
+          if (err)
+            fp_dbg ("gdix51c0: %s: poll peek failed: %s", label, err->message);
+        }
+    }
+
+  g_mutex_unlock (&irq_poll_lock);
+  return found;
+}
+
+/* Hand back a parked reply for @spi_fd, or NULL. */
+static guint8 *
+gdix51c0_irq_poll_take (int spi_fd, guint8 *out_type, gsize *out_len)
+{
+  guint8 *payload = NULL;
+
+  g_mutex_lock (&irq_poll_lock);
+  if (irq_poll_pushback && irq_poll_pushback_fd == spi_fd)
+    {
+      payload = irq_poll_pushback;
+      if (out_len)  *out_len  = irq_poll_pushback_len;
+      if (out_type) *out_type = irq_poll_pushback_type;
+      irq_poll_pushback = NULL;
+      irq_poll_pushback_len = 0;
+      irq_poll_pushback_fd = -1;
+    }
+  g_mutex_unlock (&irq_poll_lock);
   return payload;
 }
 
@@ -366,8 +596,10 @@ gdix51c0_irq_wait (struct gpiod_line_request *irq_req,
       if (now >= deadline)
         break;
 
-      int ready = gpiod_line_request_wait_edge_events (
-        irq_req, (deadline - now) * 1000);
+      /* Wait in short slices: between slices re-check the level and, for a
+       * rise wait, peek the bus for a reply that arrived without IRQ. */
+      gint64 slice = MIN (deadline - now, (gint64) GDIX51C0_IRQ_POLL_SLICE_USEC);
+      int ready = gpiod_line_request_wait_edge_events (irq_req, slice * 1000);
 
       if (ready < 0)
         {
@@ -377,7 +609,19 @@ gdix51c0_irq_wait (struct gpiod_line_request *irq_req,
         }
 
       if (ready == 0)
-        break;
+        {
+          value = gpiod_line_request_get_value (irq_req, irq_offset);
+          if (value >= 0 && (value == GPIOD_LINE_VALUE_ACTIVE) == target_high)
+            return TRUE;
+
+          /* Not during the post-reset boot pulse: keep the bus quiet then. */
+          if (target_high && !g_str_has_prefix (label, "boot") &&
+              gdix51c0_irq_poll_peek (label, g_get_monotonic_time () -
+                                      (deadline - (gint64) timeout_usec)))
+            return TRUE;
+
+          continue;
+        }
 
       int n = gpiod_line_request_read_edge_events (irq_req, event_buf, 1);
       if (n < 0)
@@ -573,7 +817,10 @@ static gboolean gdix51c0_read_and_drop (Gdix51c0Bus *bus,
 static void
 gdix51c0_cmd_prepare_send (Gdix51c0Bus *bus)
 {
-  g_usleep (GDIX51C0_CMD_SEND_DELAY_USEC);
+  static int spacing = -2;
+
+  g_usleep (gdix51c0_tune_cached ("GDIX51C0_CMD_SPACING_US",
+                                  GDIX51C0_CMD_SEND_DELAY_USEC, &spacing));
   gdix51c0_irq_drain (bus->irq_req, bus->irq_events);
 }
 
