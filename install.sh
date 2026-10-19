@@ -356,6 +356,16 @@ for acpi in "${SUPPORTED_ACPI_IDS[@]}"; do
   }
 done
 
+# libfprint's generator emits an exact MODALIAS match (acpi:ID:). Firmware that
+# also advertises a _CID presents the device as acpi:ID:ID:, which the exact
+# match misses -- leaving spidev unbound and the sensor invisible until a manual
+# bind. Widen each supported id to a glob so the rule fires with or without the
+# trailing _CID. The exact form was just validated to be present.
+for acpi in "${SUPPORTED_ACPI_IDS[@]}"; do
+  sed -i "s#ENV{MODALIAS}==\"acpi:${acpi}:\"#ENV{MODALIAS}==\"acpi:${acpi}:*\"#g" \
+    "$BUILT_UDEV_RULE"
+done
+
 # Recheck immediately before the first system write. The preflight check makes
 # --check useful, while this closes the gap if a destination changed mid-build.
 check_owned_destination "$FPRINTD_DROPIN"
