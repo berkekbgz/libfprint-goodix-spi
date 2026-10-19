@@ -141,6 +141,47 @@ gdix51c0_spi_xfer_read (int spi_fd,
   return TRUE;
 }
 
+/* The longest packet the sensor sends is an image frame: 7680 bytes of raw
+ * pixels plus the image prefix and TLS record overhead, just under 8 KiB.
+ * Twice that covers one frame and a packet queued behind it. */
+#define GDIX51C0_DRAIN_CHUNK     64
+#define GDIX51C0_DRAIN_MAX_BYTES (16 * 1024)
+
+/* A header that fails its checksum has an untrustworthy length, but the rest
+ * of the real packet (and anything queued after it) is still waiting on the
+ * bus.  Clock it out until the sensor returns idle filler, so the next read
+ * starts at a packet boundary.  The callers then retry like a lost packet.
+ * Returns the number of bytes discarded. */
+static gsize
+gdix51c0_spi_drain (int spi_fd)
+{
+  guint8 buf[GDIX51C0_DRAIN_CHUNK];
+  gsize drained = 0;
+
+  while (drained < GDIX51C0_DRAIN_MAX_BYTES)
+    {
+      gboolean idle = TRUE;
+
+      if (!gdix51c0_spi_xfer_read (spi_fd, buf, sizeof (buf), NULL))
+        break;
+      drained += sizeof (buf);
+
+      for (gsize i = 0; i < sizeof (buf); i++)
+        {
+          if (buf[i] != buf[0] || (buf[0] != 0x00 && buf[0] != 0xff))
+            {
+              idle = FALSE;
+              break;
+            }
+        }
+
+      if (idle)
+        break;
+    }
+
+  return drained;
+}
+
 guint8 *
 gdix51c0_spi_read (FpDevice *dev, int spi_fd, gsize *out_len, GError **error)
 {
@@ -203,10 +244,38 @@ gdix51c0_spi_read_typed (FpDevice *dev, int spi_fd,
       return NULL;
     }
 
+  /* Do not trust the length of a header that fails its checksum.  Observed
+   * corrupt headers are mostly real ones shifted by idle bytes (00 a0 06 00,
+   * 00 00 a0 06), whose "length" is really the packet type: reading it would
+   * swallow up to 64 KiB, including the packets queued behind it. */
   if (!gdix51c0_header_checksum_ok (hdr))
     {
-      fp_warn ("gdix51c0: header checksum mismatch (%02x %02x %02x %02x)",
-               hdr[0], hdr[1], hdr[2], hdr[3]);
+      gsize drained = gdix51c0_spi_drain (spi_fd);
+
+      fp_warn ("gdix51c0: header checksum mismatch (%02x %02x %02x %02x); "
+               "discarded %zu B", hdr[0], hdr[1], hdr[2], hdr[3], drained);
+      g_set_error (error,
+                   G_IO_ERROR,
+                   G_IO_ERROR_INVALID_DATA,
+                   "gdix51c0: header checksum mismatch "
+                   "(%02x %02x %02x %02x)",
+                   hdr[0], hdr[1], hdr[2], hdr[3]);
+      return NULL;
+    }
+
+  /* g_malloc (0) returns NULL, which every caller treats as a failure and
+   * then reads error->message.  A header can pass its checksum and still
+   * advertise zero length (a0 00 00 a0), so report it instead of returning
+   * NULL with no error set. */
+  if (length == 0)
+    {
+      g_set_error (error,
+                   G_IO_ERROR,
+                   G_IO_ERROR_INVALID_DATA,
+                   "gdix51c0: read returned zero-length header "
+                   "(%02x %02x %02x %02x)",
+                   hdr[0], hdr[1], hdr[2], hdr[3]);
+      return NULL;
     }
 
   /* g_malloc (0) returns NULL, which every caller treats as a failure and
