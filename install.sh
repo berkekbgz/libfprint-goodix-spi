@@ -350,7 +350,8 @@ BUILT_UDEV_RULE="$BUILDDIR/libfprint/70-libfprint-2.rules"
 [ -f "$BUILT_LIB" ] || { printf 'Error: built libfprint was not found.\n' >&2; exit 1; }
 [ -f "$BUILT_UDEV_RULE" ] || { printf 'Error: generated libfprint udev rules were not found.\n' >&2; exit 1; }
 for acpi in "${SUPPORTED_ACPI_IDS[@]}"; do
-  grep -Fq "ENV{MODALIAS}==\"acpi:$acpi:\"" "$BUILT_UDEV_RULE" || {
+  # Accept the glob form too: an unchanged rebuild keeps the rule widened below.
+  grep -Eq "ENV\{MODALIAS\}==\"acpi:$acpi:\*?\"" "$BUILT_UDEV_RULE" || {
     printf 'Error: generated udev rules do not contain supported ACPI id %s.\n' "$acpi" >&2
     exit 1
   }

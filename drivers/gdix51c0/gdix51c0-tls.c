@@ -197,6 +197,14 @@ gdix51c0_bio_read (BIO *b, char *buf, int len)
               }
           }
 
+      if (gdix51c0_proto_is_extra_ack (pkt, plen))
+        {
+          fp_dbg ("gdix51c0: tls bio: dropped firmware ACK (%zu B) for 0x%02x",
+                  plen, plen > 3 ? pkt[3] : 0);
+          g_free (pkt);
+          return gdix51c0_bio_read (b, buf, len);
+        }
+
       gdix51c0_irq_wait (tls->irq_req, tls->irq_events, FALSE,
                       tls->irq_offset, GDIX51C0_BOOT_TIMEOUT_USEC,
                       "tls-read-fall", &error);

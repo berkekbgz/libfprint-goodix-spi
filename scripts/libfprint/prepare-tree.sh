@@ -22,7 +22,7 @@ if [ "$#" -ne 1 ] ||
 fi
 
 mapfile -t supported_drivers < <(
-  awk '!/^#/ && NF { print $1 }' "$DEVICE_METADATA"
+  awk '!/^#/ && NF && !seen[$1]++ { print $1 }' "$DEVICE_METADATA"
 )
 [ "${#supported_drivers[@]}" -gt 0 ] || {
   printf 'Error: no supported drivers are declared in %s.\n' "$DEVICE_METADATA" >&2

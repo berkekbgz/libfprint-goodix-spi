@@ -44,7 +44,8 @@ if [ "$MODE" = "purge" ]; then
     "${GDIX51C0_PSK_STATE_FILE:-/var/lib/fprint/gdix51c0.psk}" \
     "${GDIX51C0_CHICAGO_CALIBRATION_FILE:-/var/lib/fprint/gdix51c0-calibration.bin}" \
     "/var/lib/fprint/gdix51c0-image-base.bin" \
-    "/var/lib/fprint/gdix51c0-dark-frame.bin"
+    "/var/lib/fprint/gdix51c0-dark-frame.bin" \
+    "/var/lib/fprint/gdix51c0-pmk.bin"
   exit 0
 fi
 

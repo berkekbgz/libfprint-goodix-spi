@@ -65,7 +65,7 @@ esac
 meson_options=(-Dgoodix_spi_developer="$developer_option")
 if [ "$PROFILE" = "ci" ]; then
   mapfile -t supported_drivers < <(
-    awk '!/^#/ && NF { print $1 }' "$DEVICE_METADATA"
+    awk '!/^#/ && NF && !seen[$1]++ { print $1 }' "$DEVICE_METADATA"
   )
   [ "${#supported_drivers[@]}" -gt 0 ] || {
     printf 'Error: no supported drivers are declared.\n' >&2

@@ -373,3 +373,51 @@ gdix51c0_wb_selftest (GError **error)
     }
   return TRUE;
 }
+
+/* Family constant the firmware computes at runtime (seed generator at 0x2fc2c in
+ * GF_HC460SEC_APP_14104, emulated); identical to the ST411 "fallback seed". */
+static const guint8 GDIX51C0_FACTORY_SEED[16] = {
+  0x5c, 0xba, 0x6e, 0x25, 0x81, 0x95, 0x18, 0xde,
+  0x2d, 0x53, 0xe9, 0x6d, 0xc0, 0x34, 0x7a, 0xb0
+};
+
+gboolean
+gdix51c0_factory_pmk_decrypt (const guint8 blob[GDIX51C0_FACTORY_BLOB_LEN],
+                              guint8       pmk[GDIX51C0_FACTORY_PMK_LEN])
+{
+  guint8 kdf_in[80] = { 0 };
+  guint8 digest[32];
+  guint8 plain[GDIX51C0_FACTORY_BLOB_LEN - 16];
+  unsigned int dlen = 0;
+  int n1 = 0, n2 = 0;
+  gboolean ok = FALSE;
+  EVP_CIPHER_CTX *ctx = NULL;
+
+  memcpy (kdf_in, blob, 16);
+  memcpy (kdf_in + 64, GDIX51C0_FACTORY_SEED, sizeof GDIX51C0_FACTORY_SEED);
+  if (EVP_Digest (kdf_in, sizeof kdf_in, digest, &dlen, EVP_sha256 (), NULL) != 1)
+    goto out;
+
+  ctx = EVP_CIPHER_CTX_new ();
+  if (!ctx ||
+      EVP_DecryptInit_ex (ctx, EVP_aes_128_cbc (), NULL, digest, blob) != 1 ||
+      EVP_CIPHER_CTX_set_padding (ctx, 0) != 1 ||
+      EVP_DecryptUpdate (ctx, plain, &n1, blob + 16, sizeof plain) != 1 ||
+      EVP_DecryptFinal_ex (ctx, plain + n1, &n2) != 1 ||
+      n1 + n2 != (int) sizeof plain)
+    goto out;
+
+  if (plain[0] != 0x00 || plain[1] != 0x0d ||
+      plain[2] != 0x00 || plain[3] != 0x00 || plain[4] != 0x00 ||
+      plain[5] != GDIX51C0_FACTORY_PMK_LEN)
+    goto out;
+
+  memcpy (pmk, plain + 6, GDIX51C0_FACTORY_PMK_LEN);
+  ok = TRUE;
+out:
+  EVP_CIPHER_CTX_free (ctx);
+  OPENSSL_cleanse (kdf_in, sizeof kdf_in);
+  OPENSSL_cleanse (digest, sizeof digest);
+  OPENSSL_cleanse (plain, sizeof plain);
+  return ok;
+}
