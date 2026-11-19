@@ -1,0 +1,6 @@
+# Boards whose GPIO lines differ from the GDIX51C0 defaults.
+# The installer uses a row when the ACPI id is present and the DMI product
+# name (/sys/class/dmi/id/product_name) matches. GDIX51C0_IRQ_LINE and
+# GDIX51C0_RESET_LINE in the environment still take precedence.
+# ACPI-id  DMI-product-name  irq-line  reset-line
+GXFP51A0   BOHB-WAX9         279       264

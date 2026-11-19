@@ -26,6 +26,7 @@ An out-of-tree libfprint project for Goodix host-processing fingerprint sensors 
 ## Supported devices
 
 - Goodix GDIX51C0 <sup>* tested on Huawei Matebook 16s</sup>
+- Goodix GXFP51A0 with HC32F460 MCU <sup>* tested on Huawei BOHB-WAX9, see [GXFP51A0 boards](#gxfp51a0-boards)</sup>
 
 > [!NOTE]\
 > For details, see the [support matrix](docs/SUPPORTED_DEVICES.md)
@@ -34,11 +35,9 @@ An out-of-tree libfprint project for Goodix host-processing fingerprint sensors 
 ## Known limitations
 
 - This is a pre-release. The driver has only been hardware-tested on the
-  machine listed above, and packaging or integration details may still change.
+  machines listed above, and packaging or integration details may still change.
   The driver id, storage paths, and enrolled-print format are treated as stable.
-- GDIX51C0 is currently the only supported sensor and has been hardware-tested
-  on a Huawei MateBook 16s.
-- The default GPIO lines match the tested machine. Other laptops using the same
+- The default GPIO lines match the MateBook 16s. Other laptops using the same
   sensor may require the `GDIX51C0_GPIOCHIP`, `GDIX51C0_IRQ_LINE`, and
   `GDIX51C0_RESET_LINE` overrides.
 - The sensor must be exposed through Linux spidev; this project does not install
@@ -127,6 +126,35 @@ Developer diagnostics can write biometric captures and should not be left
 enabled on an everyday installation. Runtime dump variables have no effect on
 the default release build. CI checks both build profiles and rejects a release
 library that still contains a developer hook.
+
+### GXFP51A0 boards
+
+Some Huawei and Honor laptops expose the same ChicagoHS sensor as `GXFP51A0`,
+behind an HC32F460 MCU (firmware `GF_HC460SEC_APP_1410x`). The driver
+recognises it by that ACPI id and enables the firmware workarounds it needs;
+GDIX51C0 machines are unaffected. To check for it:
+
+```bash
+ls /sys/bus/spi/devices/ | grep GXFP51A0
+cat /sys/class/dmi/id/product_name
+```
+
+The GPIO lines differ per board. On a board listed in
+[`config/gdix51c0-boards.tsv`](config/gdix51c0-boards.tsv), `./install.sh`
+picks them automatically. On any other board, read the reset and IRQ GPIOs from
+the sensor's ACPI node (`_SB.PCI0.SPI1.FPNT` on BOHB-WAX9) and pass them:
+
+```bash
+GDIX51C0_IRQ_LINE=<irq> GDIX51C0_RESET_LINE=<reset> ./install.sh
+```
+
+If that works, please add a row for the board. On first start the driver reads
+the sensor's factory TLS key, which takes about a minute, and caches it in
+`/var/lib/fprint/gdix51c0-pmk.bin` (root only).
+
+> [!WARNING]\
+> Some laptops, such as the MateBook 13, report `GXFP51A0` with an STM32 MCU
+> instead of the HC32. That variant is not supported.
 
 ## First run
 
