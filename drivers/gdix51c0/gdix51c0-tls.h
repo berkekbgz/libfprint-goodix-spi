@@ -42,7 +42,7 @@ typedef struct
   struct gpiod_edge_event_buffer *irq_events;
   unsigned int                    irq_offset;
   /* PSK; owned by us */
-  guint8                     psk[32];
+  guint8                     psk[48];  /* 32 (provisioned) or 48 (factory PMK) */
   gsize                      psk_len;
 } Gdix51c0Tls;
 

@@ -79,6 +79,13 @@ gboolean gdix51c0_irq_wait (struct gpiod_line_request *irq_req,
 void gdix51c0_irq_drain (struct gpiod_line_request *irq_req,
                       struct gpiod_edge_event_buffer *event_buf);
 
+/* Apply the GDIX51C0_QUIRK_* flags of the bound id-table entry. */
+void gdix51c0_proto_set_quirks (guint64 quirks);
+
+/* TRUE for an ACK packet that GDIX51C0_QUIRK_EXTRA_ACKS firmware sends where
+ * the 14213 flow expects data, e.g. for the 0xd1 TLS trigger. */
+gboolean gdix51c0_proto_is_extra_ack (const guint8 *buf, gsize len);
+
 /*
  * Pulse the reset line high then low.  Opens a fresh request, drives
  * the pulse, then releases the request — exactly like Python's
@@ -199,6 +206,26 @@ gdix51c0_cmd_ack_resp_same_irq (Gdix51c0Bus *bus,
                                 gsize *out_len,
                                 const char *label,
                                 GError **error);
+
+/* Read @len bytes at MCU address @addr through the F4 CRC check, one byte per
+ * up to 256 queries. Read-only. Used for the GXFP51A0 factory PMK record. */
+gboolean
+gdix51c0_crc_oracle_read (Gdix51c0Bus *bus,
+                          guint32 addr,
+                          guint8 *out,
+                          gsize len,
+                          GError **error);
+
+/* Like gdix51c0_cmd_ack_resp_same_irq() for callers that do not need the
+ * response, but accepts an ACK-only reply on GDIX51C0_QUIRK_EXTRA_ACKS
+ * firmware, where IRQ dropping after the ACK means no response follows. */
+gboolean
+gdix51c0_cmd_ack_maybe_resp (Gdix51c0Bus *bus,
+                             const guint8 *payload,
+                             gsize len,
+                             guint timeout_usec,
+                             const char *label,
+                             GError **error);
 
 
 gboolean

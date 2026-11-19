@@ -236,13 +236,20 @@ listener_drain_irq_high (Gdix51c0Listener *self)
         }
 #endif
 
+      /* Short packets (ACKs) are logged in full; read them before the
+       * enqueue hands the buffer to the consumer. */
+      char hex[8 * 3 + 1] = { 0 };
+
+      for (gsize i = 0; i < n && i < 8; i++)
+        g_snprintf (hex + 3 * i, 4, "%02x ", payload[i]);
+
       g_mutex_lock (&self->dispatch_lock);
       listener_enqueue_locked (self, kind, payload, n);
       g_cond_broadcast (&self->cond);
       g_mutex_unlock (&self->dispatch_lock);
 
-      fp_dbg ("gdix51c0: listener received outer=0x%02x kind=0x%02x len=%zu",
-              outer_type, kind, n);
+      fp_dbg ("gdix51c0: listener received outer=0x%02x kind=0x%02x len=%zu [%s%s]",
+              outer_type, kind, n, hex, n > 8 ? "..." : "");
     }
 }
 

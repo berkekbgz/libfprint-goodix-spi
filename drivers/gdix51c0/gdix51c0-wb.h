@@ -17,6 +17,7 @@ G_BEGIN_DECLS
 /* MCU register addresses (little-endian on the wire). */
 #define GDIX51C0_PSK_WB_ADDR   0xbb010003u  /* stores the 102-byte WB */
 #define GDIX51C0_PSK_HASH_ADDR 0xbb020003u  /* MCU-computed SHA-256(WB) */
+#define GDIX51C0_PSK_HASH_TAG_14103 0x0000aaaau  /* type fw 14103 returns for it */
 
 /*
  * Wrap a chosen 32-byte TLS PSK into the 102-byte white-box container the MCU
@@ -51,6 +52,18 @@ gboolean gdix51c0_wb_hash (const guint8 *wb, guint8 out[32], GError **error);
  * is not a valid WB for our key.  @out_psk must be 32 bytes.
  */
 gboolean gdix51c0_wb_unwrap (const guint8 *wb, guint8 out_psk[32], GError **error);
+
+/* Factory PMK record (GXFP51A0 / GF_HC460SEC_APP_1410x, flash 0xC000):
+ *   u32 type | u32 body_len | body = salt[16] || AES-128-CBC ciphertext
+ * key = SHA256(salt || 48 zero bytes || family seed)[:16], iv = salt,
+ * plaintext = 00 0d | u32 BE 0x30 | 48-byte PMK, which is the TLS PSK. */
+#define GDIX51C0_FACTORY_PMK_ADDR     0x0000c000u
+#define GDIX51C0_FACTORY_BODY_OFFSET  8u
+#define GDIX51C0_FACTORY_BLOB_LEN     80u  /* salt + 4 blocks: enough for the PMK */
+#define GDIX51C0_FACTORY_PMK_LEN      48u
+
+gboolean gdix51c0_factory_pmk_decrypt (const guint8 blob[GDIX51C0_FACTORY_BLOB_LEN],
+                                       guint8       pmk[GDIX51C0_FACTORY_PMK_LEN]);
 
 /*
  * Build the payload *data* for the 0xe0 register-write that provisions the WB:

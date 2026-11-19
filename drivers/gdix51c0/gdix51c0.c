@@ -35,8 +35,11 @@
 #include "gdix51c0-proto.h"
 #include "gdix51c0-tls.h"
 
+#include "gdix51c0-wb.h"
 #include <glib/gstdio.h>
+#include <openssl/crypto.h>
 #include <openssl/rand.h>
+#include <sys/stat.h>
 
 struct _FpiDeviceGdix51c0
 {
@@ -377,6 +380,8 @@ gdix51c0_open_gpios (FpiDeviceGdix51c0 *self, GError **err)
                                       "gdix51c0-irq", err);
   if (!self->irq_req)
     return FALSE;
+
+  gdix51c0_proto_set_quirks (fpi_device_get_driver_data (FP_DEVICE (self)));
 
   /* Buffer up to 16 pending edges; we typically expect 2-4 per cmd. */
   self->irq_events = gpiod_edge_event_buffer_new (16);
@@ -730,13 +735,99 @@ gdix51c0_cmd_required_same_irq (Gdix51c0Bus  *bus,
                                  const char   *label,
                                  GError      **error)
 {
-  gsize response_len = 0;
-  g_autofree guint8 *response =
-    gdix51c0_cmd_ack_resp_same_irq (bus, payload, payload_len,
-                                    timeout_usec, &response_len,
-                                    label, error);
+  return gdix51c0_cmd_ack_maybe_resp (bus, payload, payload_len,
+                                      timeout_usec, label, error);
+}
 
-  return response != NULL;
+/* ChicagoHS sensor configuration as shipped in the official Goodix driver
+ * (gfspi.dll 1.1.141.40, .rdata offset 0x3aefb0). The last two bytes are the
+ * checksum, recomputed before upload. */
+static const guint8 gdix51c0_chicago_config_256[256] = {
+  0x70, 0x11, 0x60, 0x71, 0x2c, 0x9d, 0x2c, 0xc9, 0x1c, 0xe5, 0x18, 0xfd, 0x00, 0xfd, 0x00, 0xfd,
+  0x03, 0xba, 0x00, 0x01, 0x80, 0xca, 0x00, 0x04, 0x00, 0x84, 0x00, 0x15, 0xb3, 0x86, 0x00, 0x00,
+  0xc4, 0x88, 0x00, 0x00, 0xba, 0x8a, 0x00, 0x00, 0xb2, 0x8c, 0x00, 0x00, 0xaa, 0x8e, 0x00, 0x00,
+  0xc1, 0x90, 0x00, 0xbb, 0xbb, 0x92, 0x00, 0xb1, 0xb1, 0x94, 0x00, 0x00, 0xa8, 0x96, 0x00, 0x00,
+  0xb6, 0x98, 0x00, 0x00, 0x00, 0x9a, 0x00, 0x00, 0x00, 0xd2, 0x00, 0x00, 0x00, 0xd4, 0x00, 0x00,
+  0x00, 0xd6, 0x00, 0x00, 0x00, 0xd8, 0x00, 0x00, 0x00, 0x50, 0x00, 0x01, 0x05, 0xd0, 0x00, 0x00,
+  0x00, 0x70, 0x00, 0x00, 0x00, 0x72, 0x00, 0x78, 0x56, 0x74, 0x00, 0x34, 0x12, 0x20, 0x00, 0x10,
+  0x40, 0x2a, 0x01, 0x02, 0x04, 0x22, 0x00, 0x01, 0x20, 0x24, 0x00, 0x32, 0x00, 0x80, 0x00, 0x01,
+  0x00, 0x5c, 0x00, 0x80, 0x00, 0x56, 0x00, 0x24, 0x20, 0x58, 0x00, 0x03, 0x02, 0x32, 0x00, 0x0c,
+  0x02, 0x66, 0x00, 0x03, 0x00, 0x7c, 0x00, 0x00, 0x58, 0x82, 0x00, 0x80, 0x15, 0x2a, 0x01, 0x82,
+  0x03, 0x22, 0x00, 0x01, 0x20, 0x24, 0x00, 0x14, 0x00, 0x80, 0x00, 0x01, 0x00, 0x5c, 0x00, 0x00,
+  0x01, 0x56, 0x00, 0x04, 0x20, 0x58, 0x00, 0x03, 0x02, 0x32, 0x00, 0x0c, 0x02, 0x66, 0x00, 0x03,
+  0x00, 0x7c, 0x00, 0x00, 0x58, 0x82, 0x00, 0x80, 0x15, 0x2a, 0x01, 0x08, 0x00, 0x5c, 0x00, 0x80,
+  0x00, 0x54, 0x00, 0x10, 0x01, 0x62, 0x00, 0x04, 0x03, 0x64, 0x00, 0x19, 0x00, 0x66, 0x00, 0x03,
+  0x00, 0x7c, 0x00, 0x01, 0x58, 0x2a, 0x01, 0x08, 0x00, 0x5c, 0x00, 0x00, 0x01, 0x52, 0x00, 0x08,
+  0x00, 0x54, 0x00, 0x00, 0x01, 0x66, 0x00, 0x03, 0x00, 0x7c, 0x00, 0x01, 0x58, 0x00, 0xbc, 0xff,
+};
+
+/* GDIX51C0_QUIRK_CONFIG_256: GF_HC460SEC_APP_1410x applies the sensor
+ * configuration only from a 256-byte 0x90 block with a valid checksum, and only
+ * an applied configuration opens the gate for FDT/image/nav commands (cmd0 <= 5).
+ * The 14213 232-byte block is ACKed, answered with status 0 and ignored. */
+static gboolean
+gdix51c0_upload_config_256 (Gdix51c0Bus *bus, GError **error)
+{
+  guint8 cfg[256];
+  guint32 sum = 0xa5a5;
+  gsize pkt_len = 0, resp_len = 0;
+  g_autofree guint8 *pkt = NULL;
+  g_autofree guint8 *resp = NULL;
+
+  memcpy (cfg, gdix51c0_chicago_config_256, sizeof cfg);
+  for (gsize i = 0; i < sizeof cfg - 2; i += 2)
+    sum += (guint32) cfg[i] | ((guint32) cfg[i + 1] << 8);
+  sum = (0u - sum) & 0xffffu;
+  cfg[254] = (guint8) sum;
+  cfg[255] = (guint8) (sum >> 8);
+
+  pkt = gdix51c0_make_payload_packet (0x90, cfg, sizeof cfg, &pkt_len);
+  resp = gdix51c0_cmd_ack_resp_same_irq (bus, pkt, pkt_len, 1000000, &resp_len,
+                                         "upload-config-256", error);
+  if (!resp)
+    return FALSE;
+  if (resp_len < 4 || resp[3] != 1)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                   "gdix51c0: the sensor rejected the configuration (status %#04x)",
+                   resp_len >= 4 ? resp[3] : 0);
+      return FALSE;
+    }
+  fp_dbg ("gdix51c0: 256-byte sensor configuration applied");
+  return TRUE;
+}
+
+/* GDIX51C0_QUIRK_CONFIG_256 firmware takes the DAC as four sensor-register
+ * writes after setmode idle, before and again after the configuration, as the
+ * Windows ChicagoHUsetDac does. 0x98 is only ACKed there, and without these
+ * writes the readout covers every fourth row and FDT samples read zero. */
+static gboolean
+gdix51c0_set_dac_registers (Gdix51c0Bus  *bus,
+                            const guint8 *setmode_idle,
+                            gsize         setmode_idle_size,
+                            const guint   dac[4],
+                            GError      **error)
+{
+  static const guint16 regs[4] = { 0x0220, 0x0236, 0x0238, 0x023a };
+
+  if (!gdix51c0_cmd_ack (bus, setmode_idle, setmode_idle_size,
+                         "setmode-idle", error))
+    return FALSE;
+
+  for (guint i = 0; i < G_N_ELEMENTS (regs); i++)
+    {
+      guint8 data[GOODIX_COMMAND_REGISTER_PAYLOAD_SIZE];
+      guint8 pkt[GOODIX_COMMAND_REGISTER_PAYLOAD_SIZE + GOODIX_WIRE_COMMAND_OVERHEAD];
+      gsize pkt_size = 0;
+
+      goodix_command_encode_register_write (regs[i], (guint16) dac[i], data);
+      if (!goodix_wire_encode_command (GOODIX_COMMAND_WRITE_SENSOR_REGISTER,
+                                       data, sizeof (data), pkt, sizeof (pkt),
+                                       &pkt_size) ||
+          !gdix51c0_cmd_ack (bus, pkt, pkt_size, "write-dac-register", error))
+        return FALSE;
+    }
+  return TRUE;
 }
 
 /* Full 14213 pre-TLS init sequence recovered from official-driver traces,
@@ -1082,9 +1173,19 @@ gdix51c0_init_sequence (FpiDeviceGdix51c0 *self, GError **error)
   };
   dac_payload[sizeof (dac_payload) - 1] =
     gdix51c0_payload_checksum (dac_payload, sizeof (dac_payload) - 1);
-  if (!gdix51c0_cmd_required_same_irq (&bus,
-                                       dac_payload, sizeof (dac_payload),
-                                       1000000, "send-dac", error))
+  const gboolean config_256 =
+    (fpi_device_get_driver_data (FP_DEVICE (self)) & GDIX51C0_QUIRK_CONFIG_256) != 0;
+  const guint dac_values[4] = { dac_main, dac_1, dac_2, dac_3 };
+
+  if (config_256)
+    {
+      if (!gdix51c0_set_dac_registers (&bus, setmode_idle, sizeof (setmode_idle),
+                                       dac_values, error))
+        return FALSE;
+    }
+  else if (!gdix51c0_cmd_required_same_irq (&bus,
+                                            dac_payload, sizeof (dac_payload),
+                                            1000000, "send-dac", error))
     return FALSE;
 
   /* upload mcu config (cmd 0x90) — 232-byte payload, ack+resp same cycle.
@@ -1153,6 +1254,15 @@ gdix51c0_init_sequence (FpiDeviceGdix51c0 *self, GError **error)
    * higher 0x0b78 bias and every frame cliffs at row 31.  This was THE root
    * cause of the cliff.  Must run after the DAC/timing patches, before the
    * outer packet checksum. */
+  if (config_256)
+    {
+      if (!gdix51c0_upload_config_256 (&bus, error) ||
+          !gdix51c0_set_dac_registers (&bus, setmode_idle, sizeof (setmode_idle),
+                                       dac_values, error))
+        return FALSE;
+      goto config_done;
+    }
+
   if (!goodix_mcu_config_update_checksum (cfg_payload + 3,
                                           sizeof (cfg_payload) - 4))
     {
@@ -1168,6 +1278,7 @@ gdix51c0_init_sequence (FpiDeviceGdix51c0 *self, GError **error)
                                        1000000, "upload-mcu-config", error))
     return FALSE;
 
+config_done:
   g_usleep (200000);
   gdix51c0_irq_drain (self->irq_req, self->irq_events);
 
@@ -1307,12 +1418,98 @@ static gboolean gdix51c0_fdt_measure_base (FpiDeviceGdix51c0 *self,
                                            GError           **error);
 static gboolean gdix51c0_capture_nav_data (FpiDeviceGdix51c0 *self, GError **error);
 
+/* GDIX51C0_QUIRK_FACTORY_PMK: the TLS PSK is the 48-byte factory PMK the MCU
+ * decrypts at boot from flash 0xC000. The firmware cannot be given another key
+ * (0xe0 is a no-op) and has no memory read, so the record is read once through
+ * the F4 CRC check and the PMK is cached only after a handshake proves it. */
+static gboolean
+gdix51c0_factory_pmk_load_cache (guint8 pmk[GDIX51C0_FACTORY_PMK_LEN])
+{
+  g_autofree gchar *data = NULL;
+  gsize len = 0;
+  GStatBuf st;
+
+  if (g_stat (GDIX51C0_DEFAULT_PMK_CACHE_FILE, &st) != 0)
+    return FALSE;
+  if (!S_ISREG (st.st_mode) || (st.st_mode & 0077) != 0)
+    {
+      fp_warn ("gdix51c0: ignoring PMK cache with unsafe permissions");
+      return FALSE;
+    }
+  if (!g_file_get_contents (GDIX51C0_DEFAULT_PMK_CACHE_FILE, &data, &len, NULL))
+    return FALSE;
+  if (len != GDIX51C0_FACTORY_PMK_LEN)
+    {
+      OPENSSL_cleanse (data, len);
+      return FALSE;
+    }
+  memcpy (pmk, data, GDIX51C0_FACTORY_PMK_LEN);
+  OPENSSL_cleanse (data, len);
+  return TRUE;
+}
+
+static void
+gdix51c0_factory_pmk_save_cache (const guint8 pmk[GDIX51C0_FACTORY_PMK_LEN])
+{
+  g_autoptr(GError) err = NULL;
+  g_autofree gchar *dir = g_path_get_dirname (GDIX51C0_DEFAULT_PMK_CACHE_FILE);
+
+  if (g_mkdir_with_parents (dir, 0700) != 0 ||
+      !g_file_set_contents_full (GDIX51C0_DEFAULT_PMK_CACHE_FILE,
+                                 (const gchar *) pmk, GDIX51C0_FACTORY_PMK_LEN,
+                                 G_FILE_SET_CONTENTS_CONSISTENT |
+                                 G_FILE_SET_CONTENTS_DURABLE,
+                                 0600, &err))
+    fp_warn ("gdix51c0: could not cache the factory PMK at %s: %s; it will be "
+             "read from the sensor again next time",
+             GDIX51C0_DEFAULT_PMK_CACHE_FILE, err ? err->message : g_strerror (errno));
+  else
+    fp_info ("gdix51c0: factory PMK cached at %s", GDIX51C0_DEFAULT_PMK_CACHE_FILE);
+}
+
+static gboolean
+gdix51c0_factory_pmk_get (Gdix51c0Bus *bus,
+                          guint8       pmk[GDIX51C0_FACTORY_PMK_LEN],
+                          gboolean    *from_cache,
+                          GError     **error)
+{
+  guint8 blob[GDIX51C0_FACTORY_BLOB_LEN];
+  gboolean ok;
+
+  *from_cache = gdix51c0_factory_pmk_load_cache (pmk);
+  if (*from_cache)
+    return TRUE;
+
+  fp_info ("gdix51c0: reading the factory PMK record from the sensor "
+           "(one-time, about a minute)");
+  if (!gdix51c0_crc_oracle_read (bus,
+                                 GDIX51C0_FACTORY_PMK_ADDR + GDIX51C0_FACTORY_BODY_OFFSET,
+                                 blob, sizeof blob, error))
+    return FALSE;
+
+  ok = gdix51c0_factory_pmk_decrypt (blob, pmk);
+  OPENSSL_cleanse (blob, sizeof blob);
+  if (!ok)
+    {
+      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                           "gdix51c0: factory PMK record did not decrypt "
+                           "(unknown record format on this firmware)");
+      return FALSE;
+    }
+  fp_info ("gdix51c0: factory PMK recovered from the sensor");
+  return TRUE;
+}
+
 static gboolean
 gdix51c0_session_tls_start (FpiDeviceGdix51c0 *self,
                             gboolean          *reset_required,
                             GError           **error)
 {
-  guint8 psk[32];
+  guint8 psk[GDIX51C0_FACTORY_PMK_LEN];
+  gsize psk_len = GDIX51C0_PSK_LEN;
+  const gboolean factory_pmk =
+    (fpi_device_get_driver_data (FP_DEVICE (self)) & GDIX51C0_QUIRK_FACTORY_PMK) != 0;
+  gboolean pmk_from_cache = FALSE;
   guint8 mcu_psk[32];
   guint8 existing[32] = { 0 };
   gboolean mcu_present = FALSE;
@@ -1328,6 +1525,14 @@ gdix51c0_session_tls_start (FpiDeviceGdix51c0 *self,
 
   g_return_val_if_fail (reset_required != NULL, FALSE);
   *reset_required = FALSE;
+
+  if (factory_pmk)
+    {
+      if (!gdix51c0_factory_pmk_get (&bus, psk, &pmk_from_cache, error))
+        return FALSE;
+      psk_len = GDIX51C0_FACTORY_PMK_LEN;
+      goto start_tls;
+    }
 
   /* Known PSK before any provisioning: env override wins, else persisted state. */
   {
@@ -1370,6 +1575,11 @@ gdix51c0_session_tls_start (FpiDeviceGdix51c0 *self,
                                    "gdix51c0: provision: RAND_bytes failed");
               return FALSE;
             }
+          /* Persist before the destructive write. If the sensor takes the key
+           * but the write or verify then fails, the next attempt must reuse
+           * this key instead of rolling one the host never kept. */
+          else if (!gdix51c0_save_psk_state (want, error))
+            return FALSE;
           else
             do_provision = TRUE;
         }
@@ -1421,7 +1631,7 @@ gdix51c0_session_tls_start (FpiDeviceGdix51c0 *self,
               }
           }
 
-          memcpy (psk, want, sizeof (psk));
+          memcpy (psk, want, GDIX51C0_PSK_LEN);
           memcpy (existing, want, sizeof (existing));
           have_existing = TRUE;
           psk_ready = TRUE;
@@ -1460,11 +1670,11 @@ gdix51c0_session_tls_start (FpiDeviceGdix51c0 *self,
     }
   else if (have_existing)
     {
-      memcpy (psk, existing, sizeof (psk));
+      memcpy (psk, existing, GDIX51C0_PSK_LEN);
     }
   else if (mcu_present)
     {
-      memcpy (psk, mcu_psk, sizeof (psk));
+      memcpy (psk, mcu_psk, GDIX51C0_PSK_LEN);
       fp_info ("gdix51c0: using PSK recovered from the sensor (0xbb010003)");
     }
   else if (!gdix51c0_load_psk (psk, error))   /* emits the "no PSK" error */
@@ -1472,6 +1682,7 @@ gdix51c0_session_tls_start (FpiDeviceGdix51c0 *self,
       return FALSE;
     }
 
+start_tls:
   /* Acceptance-only: make the host use a wrong key for one activation.  This
    * exercises the real OpenSSL Finished-record classifier without changing
    * the persisted key or the sensor before the bounded recovery path runs. */
@@ -1486,7 +1697,7 @@ gdix51c0_session_tls_start (FpiDeviceGdix51c0 *self,
 
   if (!gdix51c0_tls_init (&self->tls, FP_DEVICE (self), self->spi_fd,
                        self->irq_req, self->irq_events, self->irq_offset,
-                       psk, sizeof (psk), error))
+                       psk, psk_len, error))
     return FALSE;
 
   {
@@ -1502,6 +1713,18 @@ gdix51c0_session_tls_start (FpiDeviceGdix51c0 *self,
                            G_IO_ERROR_PERMISSION_DENIED);
 
         gdix51c0_tls_free (&self->tls);
+
+        if (factory_pmk)
+          {
+            if (auth_mismatch && pmk_from_cache)
+              {
+                g_unlink (GDIX51C0_DEFAULT_PMK_CACHE_FILE);
+                fp_warn ("gdix51c0: the sensor rejected the cached factory PMK; "
+                         "it will be read from the sensor again");
+              }
+            g_propagate_error (error, g_steal_pointer (&handshake_error));
+            return FALSE;
+          }
 
         if (auth_mismatch && prov && *prov && have_existing &&
             !self->psk_reprovision_attempted_this_open)
@@ -1550,6 +1773,10 @@ gdix51c0_session_tls_start (FpiDeviceGdix51c0 *self,
         return FALSE;
       }
   }
+
+  if (factory_pmk && !pmk_from_cache)
+    gdix51c0_factory_pmk_save_cache (psk);
+  OPENSSL_cleanse (psk, sizeof (psk));
 
   self->tls_ready = TRUE;
   fp_dbg ("gdix51c0: TLS ready; capture listener not started yet");
@@ -2170,20 +2397,31 @@ gdix51c0_session_deactivate (FpiDeviceGdix51c0 *self)
 /* ------------------------------------------------------------------ */
 static void
 gdix51c0_decode_12bpp_to_16bpp (const guint8 *packed, gsize packed_len,
+                             gsize row_stride,
                              guint16 *out16, gsize out_pixels)
 {
-  g_autofree guint16 *stream = g_new (guint16, out_pixels);
+  const gsize rows = out_pixels / GDIX51C0_SENSOR_WIDTH;
+  const gsize stream_pixels = row_stride * rows;
+  g_autofree guint16 *stream = g_new (guint16, stream_pixels);
   gsize decoded;
 
   memset (out16, 0, out_pixels * sizeof (guint16));
-  decoded = goodix_raw12_decode (packed, packed_len, stream, out_pixels);
+  decoded = goodix_raw12_decode (packed, packed_len, stream, stream_pixels);
   for (gsize n = 0; n < decoded; n++)
     {
+      /* @row_stride > 64 (GDIX51C0_QUIRK_PADDED_FRAME) pads each 64-sample row;
+       * drop the padding so m indexes the same stream as the unpadded format. */
+      gsize col = n % row_stride;
+      gsize m = (n / row_stride) * GDIX51C0_SENSOR_WIDTH + col;
+
+      if (col >= GDIX51C0_SENSOR_WIDTH)
+        continue;
+
       /* Goodix raw12 unpacking is common. ChicagoHUDataRegroup is not: the
-       * Milan stream uses a 64-sample fast axis, so n maps into a 64-row by
+       * Milan stream uses a 64-sample fast axis, so m maps into a 64-row by
        * 80-column matcher image. */
-      gsize dst = (n % GDIX51C0_SENSOR_WIDTH) * GDIX51C0_SENSOR_HEIGHT
-                  + (n / GDIX51C0_SENSOR_WIDTH);
+      gsize dst = (m % GDIX51C0_SENSOR_WIDTH) * GDIX51C0_SENSOR_HEIGHT
+                  + (m / GDIX51C0_SENSOR_WIDTH);
 
       if (dst < out_pixels)
         out16[dst] = stream[n];
@@ -3513,12 +3751,17 @@ gdix51c0_capture_image_raw (FpiDeviceGdix51c0 *self,
         }
 #endif
 
-      if (plain_len < GDIX51C0_IMAGE_PREFIX_LEN + GDIX51C0_FRAME_BYTES)
+      const gboolean padded =
+        (fpi_device_get_driver_data (FP_DEVICE (self)) & GDIX51C0_QUIRK_PADDED_FRAME) != 0;
+      const gsize row_stride = padded ? GDIX51C0_PADDED_ROW_STRIDE : GDIX51C0_SENSOR_WIDTH;
+      const gsize frame_bytes = padded ? GDIX51C0_PADDED_FRAME_BYTES : GDIX51C0_FRAME_BYTES;
+
+      if (plain_len < GDIX51C0_IMAGE_PREFIX_LEN + frame_bytes)
         {
           g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
                        "gdix51c0: image plaintext too short: %zu, need at least %u",
                        plain_len,
-                       (guint) (GDIX51C0_IMAGE_PREFIX_LEN + GDIX51C0_FRAME_BYTES));
+                       (guint) (GDIX51C0_IMAGE_PREFIX_LEN + frame_bytes));
           return NULL;
         }
 
@@ -3532,7 +3775,8 @@ gdix51c0_capture_image_raw (FpiDeviceGdix51c0 *self,
 
       guint16 *raw = g_malloc (GDIX51C0_FRAME_PIXELS * sizeof (guint16));
       gdix51c0_decode_12bpp_to_16bpp (image_packed,
-                                      GDIX51C0_FRAME_BYTES,
+                                      frame_bytes,
+                                      row_stride,
                                       raw,
                                       GDIX51C0_FRAME_PIXELS);
 #ifdef GOODIX_SPI_DEVELOPER

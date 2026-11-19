@@ -27,6 +27,27 @@
 #include "gdix51c0-proto.h"
 #include "gdix51c0-wb.h"
 
+/* GDIX51C0_QUIRK_* flags of the bound id-table entry; one device per process. */
+static guint64 proto_quirks;
+
+void
+gdix51c0_proto_set_quirks (guint64 quirks)
+{
+  proto_quirks = quirks;
+}
+
+/* GDIX51C0_QUIRK_SLOW_TURNAROUND: a write sent within microseconds of a read
+ * (or within a few ms of the previous reply, while the MCU is still busy) is
+ * lost and desynchronises the next one, and a same-IRQ response can come
+ * well after its ACK while IRQ stays high, so idle headers are polled longer. */
+#define GDIX51C0_READ_TO_WRITE_GAP_USEC  2000
+#define GDIX51C0_LOST_COMMAND_BACKOFF_USEC 20000
+#define GDIX51C0_HEADER_TO_BODY_USEC     300
+#define GDIX51C0_SLOW_IDLE_POLL_USEC     5000
+#define GDIX51C0_SLOW_IDLE_BUDGET_USEC   (1000 * 1000)
+
+static gint64 last_read_end_usec;
+
 /* ---------------- packet construction ---------------- */
 
 guint8
@@ -70,6 +91,31 @@ gdix51c0_make_payload_packet (guint8 type, const guint8 *data, gsize data_len,
 
 /* ---------------- SPI sync I/O ---------------- */
 
+/* One write as a full-duplex transfer. With GDIX51C0_QUIRK_SLOW_TURNAROUND the
+ * HC32F460 intermittently loses commands sent with half-duplex write(), while
+ * full-duplex transfers (as the reads use) went through without loss. */
+static ssize_t
+gdix51c0_spi_write_duplex (int spi_fd, const guint8 *data, gsize len)
+{
+  g_autofree guint8 *rx = g_malloc (len);
+  struct spi_ioc_transfer tr = {
+    .tx_buf = (uintptr_t) data,
+    .rx_buf = (uintptr_t) rx,
+    .len = len,
+    .bits_per_word = 8,
+  };
+
+  return ioctl (spi_fd, SPI_IOC_MESSAGE (1), &tr) < 1 ? -1 : (ssize_t) len;
+}
+
+static ssize_t
+gdix51c0_spi_write_raw (int spi_fd, const guint8 *data, gsize len)
+{
+  if (proto_quirks & GDIX51C0_QUIRK_SLOW_TURNAROUND)
+    return gdix51c0_spi_write_duplex (spi_fd, data, len);
+  return write (spi_fd, data, len);
+}
+
 gboolean
 gdix51c0_spi_write (FpDevice *dev, int spi_fd,
                  guint8 outer_type,
@@ -79,8 +125,14 @@ gdix51c0_spi_write (FpDevice *dev, int spi_fd,
   /* Mirror python-spidev's writebytes() exactly: one ioctl per buffer.
    * Header and payload as two SPI transactions (two CS cycles).        */
   (void) dev;
+  if (proto_quirks & GDIX51C0_QUIRK_SLOW_TURNAROUND)
+    {
+      gint64 since = g_get_monotonic_time () - last_read_end_usec;
+      if (since < GDIX51C0_READ_TO_WRITE_GAP_USEC)
+        g_usleep (GDIX51C0_READ_TO_WRITE_GAP_USEC - since);
+    }
   g_autofree guint8 *hdr = gdix51c0_make_header_packet (outer_type, (guint16) payload_len);
-  ssize_t n = write (spi_fd, hdr, 4);
+  ssize_t n = gdix51c0_spi_write_raw (spi_fd, hdr, 4);
   if (n != 4)
     {
       g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
@@ -89,7 +141,11 @@ gdix51c0_spi_write (FpDevice *dev, int spi_fd,
     }
   if (payload_len == 0)
     return TRUE;
-  n = write (spi_fd, payload, payload_len);
+  /* The HC32 needs a moment after the header to arm reception of the body;
+   * a body clocked out within microseconds is lost with its command. */
+  if (proto_quirks & GDIX51C0_QUIRK_SLOW_TURNAROUND)
+    g_usleep (GDIX51C0_HEADER_TO_BODY_USEC);
+  n = gdix51c0_spi_write_raw (spi_fd, payload, payload_len);
   if ((gsize) n != payload_len)
     {
       g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
@@ -138,6 +194,7 @@ gdix51c0_spi_xfer_read (int spi_fd,
       done += chunk;
     }
 
+  last_read_end_usec = g_get_monotonic_time ();
   return TRUE;
 }
 
@@ -204,8 +261,10 @@ gdix51c0_spi_read_typed (FpDevice *dev, int spi_fd,
   guint8 hdr[4];
   gboolean saw_all_zero = FALSE;
   gboolean saw_all_ff = FALSE;
+  const gboolean slow = (proto_quirks & GDIX51C0_QUIRK_SLOW_TURNAROUND) != 0;
+  const gint64 slow_deadline = g_get_monotonic_time () + GDIX51C0_SLOW_IDLE_BUDGET_USEC;
 
-  for (guint attempt = 0; attempt < 4; attempt++)
+  for (guint attempt = 0; ; attempt++)
     {
       if (!gdix51c0_spi_xfer_read (spi_fd, hdr, sizeof (hdr), error))
         return NULL;
@@ -216,12 +275,13 @@ gdix51c0_spi_read_typed (FpDevice *dev, int spi_fd,
       if (!saw_all_zero && !saw_all_ff)
         break;
 
-      if (attempt + 1 == 4)
+      if (slow ? g_get_monotonic_time () >= slow_deadline : attempt + 1 == 4)
         break;
 
-      fp_dbg ("gdix51c0: SPI read saw idle %s header, retrying",
-              saw_all_ff ? "all-FF" : "all-zero");
-      g_usleep (5000 + attempt * 10000);
+      if (!slow || attempt < 4)
+        fp_dbg ("gdix51c0: SPI read saw idle %s header, retrying",
+                saw_all_ff ? "all-FF" : "all-zero");
+      g_usleep (slow ? GDIX51C0_SLOW_IDLE_POLL_USEC : 5000 + attempt * 10000);
     }
 
   if (saw_all_zero)
@@ -313,6 +373,58 @@ gdix51c0_spi_read_typed (FpDevice *dev, int spi_fd,
 
 /* ---------------- IRQ + reset ---------------- */
 
+/* On boards whose firmware locks the IRQ pad as level-triggered, the kernel
+ * reports a RISING edge on every interrupt while the line is high and never a
+ * FALLING one. Buffered rising events outlive the level that produced them, so
+ * an edge wait for the next response fires on the previous one's leftovers.
+ * In level mode, events only wake the waiter and the line level decides. */
+#define GDIX51C0_IRQ_LEVEL_POLL_USEC 1000
+
+static gboolean
+gdix51c0_irq_wait_level (struct gpiod_line_request     *irq_req,
+                         struct gpiod_edge_event_buffer *event_buf,
+                         gboolean                        target_high,
+                         unsigned int                    irq_offset,
+                         gint64                          deadline,
+                         const char                     *label,
+                         GError                        **error)
+{
+  for (;;)
+    {
+      enum gpiod_line_value value =
+        gpiod_line_request_get_value (irq_req, irq_offset);
+
+      if (value < 0)
+        {
+          g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                       "gdix51c0: %s: get IRQ value failed", label);
+          return FALSE;
+        }
+      if ((value == GPIOD_LINE_VALUE_ACTIVE) == target_high)
+        return TRUE;
+
+      gint64 now = g_get_monotonic_time ();
+      if (now >= deadline)
+        {
+          g_set_error (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                       "gdix51c0: %s: IRQ level never went %s",
+                       label, target_high ? "high" : "low");
+          return FALSE;
+        }
+
+      gint64 slice = MIN (deadline - now, GDIX51C0_IRQ_LEVEL_POLL_USEC);
+      int ready = gpiod_line_request_wait_edge_events (irq_req, slice * 1000);
+      if (ready < 0)
+        {
+          g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                       "gdix51c0: %s: wait_edge_events failed", label);
+          return FALSE;
+        }
+      if (ready > 0)
+        gpiod_line_request_read_edge_events (irq_req, event_buf, 16);
+    }
+}
+
 void
 gdix51c0_irq_drain (struct gpiod_line_request *irq_req,
                  struct gpiod_edge_event_buffer *event_buf)
@@ -358,6 +470,10 @@ gdix51c0_irq_wait (struct gpiod_line_request *irq_req,
 
   if ((value == GPIOD_LINE_VALUE_ACTIVE) == target_high)
     return TRUE;
+
+  if (proto_quirks & GDIX51C0_QUIRK_LEVEL_IRQ)
+    return gdix51c0_irq_wait_level (irq_req, event_buf, target_high,
+                                    irq_offset, deadline, label, error);
 
   for (;;)
     {
@@ -664,8 +780,12 @@ gdix51c0_cmd_send_and_ack (Gdix51c0Bus *bus,
       if (attempt < GDIX51C0_CMD_ATTEMPTS)
         {
           fp_dbg ("gdix51c0: %s ACK attempt 1/2 failed (%s); "
-                  "immediate same-command resend",
+                  "same-command resend",
                   label, local_error ? local_error->message : "?");
+          /* A command lost while the HC32 is still busy is lost again if
+           * resent at once; give it time to finish first. */
+          if (proto_quirks & GDIX51C0_QUIRK_SLOW_TURNAROUND)
+            g_usleep (GDIX51C0_LOST_COMMAND_BACKOFF_USEC);
           continue;
         }
 
@@ -676,14 +796,65 @@ gdix51c0_cmd_send_and_ack (Gdix51c0Bus *bus,
   g_assert_not_reached ();
 }
 
+/* GF_HC460SEC_APP_14103 ACKs commands that 14213 answers without one: 0xd5
+ * (ACK ~13 ms later) and single-response commands such as 0xaf, whose ACK
+ * precedes the response. An ACK names the command with bit 0 cleared. */
+#define GDIX51C0_EXTRA_ACK_WINDOW_USEC 50000
+
+static gboolean
+gdix51c0_is_ack_for (const guint8 *buf, gsize len, guint8 command)
+{
+  return len >= 4 && buf[0] == GDIX51C0_PKT_READ &&
+         (buf[3] & 0xfe) == (command & 0xfe);
+}
+
+gboolean
+gdix51c0_proto_is_extra_ack (const guint8 *buf, gsize len)
+{
+  /* A TLS record starts with its content type (0x14..0x17), never 0xb0. */
+  return (proto_quirks & GDIX51C0_QUIRK_EXTRA_ACKS) && len >= 4 &&
+         buf[0] == GDIX51C0_PKT_READ;
+}
+
+/* Read and drop a reply to a command the caller treats as no-ACK. Left unread
+ * it holds IRQ high, and the next command takes it for its own reply. */
+static void
+gdix51c0_absorb_extra_ack (Gdix51c0Bus *bus, guint8 command, const char *label)
+{
+  g_autoptr(GError) local_error = NULL;
+  g_autofree guint8 *buf = NULL;
+  gsize n = 0;
+
+  if (!gdix51c0_irq_wait (bus->irq_req, bus->irq_events, TRUE, bus->irq_offset,
+                          GDIX51C0_EXTRA_ACK_WINDOW_USEC, label, NULL))
+    return;
+
+  buf = gdix51c0_spi_read (bus->dev, bus->spi_fd, &n, &local_error);
+  if (!buf)
+    fp_warn ("gdix51c0: %s: reading extra ACK failed: %s",
+             label, local_error->message);
+  else if (gdix51c0_is_ack_for (buf, n, command))
+    fp_dbg ("gdix51c0: %s: dropped firmware ACK", label);
+  else
+    fp_warn ("gdix51c0: %s: dropped unexpected packet 0x%02x (%zu B)",
+             label, buf[0], n);
+
+  gdix51c0_irq_wait (bus->irq_req, bus->irq_events, FALSE, bus->irq_offset,
+                     GDIX51C0_EXTRA_ACK_WINDOW_USEC, label, NULL);
+}
+
 gboolean
 gdix51c0_cmd_no_ack (Gdix51c0Bus *bus, const guint8 *payload, gsize len,
                   const char *label, GError **error)
 {
   fp_dbg ("gdix51c0: %s (no-ack, %zu B)", label, len);
   gdix51c0_cmd_prepare_send (bus);
-  return gdix51c0_spi_write (bus->dev, bus->spi_fd, GDIX51C0_PKT_WRITE,
-                          payload, len, error);
+  if (!gdix51c0_spi_write (bus->dev, bus->spi_fd, GDIX51C0_PKT_WRITE,
+                           payload, len, error))
+    return FALSE;
+  if (proto_quirks & GDIX51C0_QUIRK_EXTRA_ACKS)
+    gdix51c0_absorb_extra_ack (bus, payload[0], label);
+  return TRUE;
 }
 
 static gboolean
@@ -724,7 +895,33 @@ gdix51c0_cmd_ack_resp (Gdix51c0Bus *bus, const guint8 *payload, gsize len,
                     const char *label, GError **error)
 {
   fp_dbg ("gdix51c0: %s (ack then resp, %zu B)", label, len);
-  return gdix51c0_cmd_ack_then_resp (bus, payload, len, label, error);
+  if (!(proto_quirks & GDIX51C0_QUIRK_EXTRA_ACKS))
+    return gdix51c0_cmd_ack_then_resp (bus, payload, len, label, error);
+
+  /* fw 14103 answers the 0xe0 PSK write with an accepted ACK and no response
+   * within a second; the caller verifies the write by reading it back. */
+  if (!gdix51c0_cmd_send_and_ack (bus, payload, len, TRUE, label, error))
+    return FALSE;
+  if (!gdix51c0_irq_wait (bus->irq_req, bus->irq_events, TRUE, bus->irq_offset,
+                          GDIX51C0_CMD_MIN_RESPONSE_TIMEOUT_USEC, label, NULL))
+    {
+      fp_dbg ("gdix51c0: %s: ACK only, no response", label);
+      return TRUE;
+    }
+
+  gsize n = 0;
+  g_autofree guint8 *response = gdix51c0_spi_read (bus->dev, bus->spi_fd, &n, error);
+  if (!response)
+    return FALSE;
+  if (n == 0 || response[0] != payload[0])
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                   "gdix51c0: %s expected response 0x%02x, got 0x%02x (%zu B)",
+                   label, payload[0], n > 0 ? response[0] : 0, n);
+      return FALSE;
+    }
+  return gdix51c0_irq_wait (bus->irq_req, bus->irq_events, FALSE, bus->irq_offset,
+                            GDIX51C0_CMD_MIN_RESPONSE_TIMEOUT_USEC, label, error);
 }
 
 guint8 *
@@ -863,6 +1060,18 @@ gdix51c0_cmd_single_resp (Gdix51c0Bus *bus,
         {
           buf = gdix51c0_spi_read (bus->dev, bus->spi_fd,
                                    &response_len, &local_error);
+          if (buf && (proto_quirks & GDIX51C0_QUIRK_EXTRA_ACKS) &&
+              gdix51c0_is_ack_for (buf, response_len, payload[0]))
+            {
+              fp_dbg ("gdix51c0: %s: skipping firmware ACK before response",
+                      label);
+              g_clear_pointer (&buf, g_free);
+              if (gdix51c0_irq_wait (bus->irq_req, bus->irq_events, TRUE,
+                                     bus->irq_offset, response_timeout_usec,
+                                     label, &local_error))
+                buf = gdix51c0_spi_read (bus->dev, bus->spi_fd,
+                                         &response_len, &local_error);
+            }
           if (buf &&
               !gdix51c0_irq_wait (bus->irq_req, bus->irq_events, FALSE,
                                   bus->irq_offset, response_timeout_usec,
@@ -990,6 +1199,155 @@ gdix51c0_cmd_ack_resp_same_irq (Gdix51c0Bus *bus,
     }
 
   g_assert_not_reached ();
+}
+
+/* Under GDIX51C0_QUIRK_EXTRA_ACKS, IRQ after the ACK tells whether a response
+ * follows: it stays high until a pending response is read (0xa8, up to ~200 ms)
+ * and drops when the ACK is all there is (0x98 send-dac on fw 14103). */
+#define GDIX51C0_ACK_ONLY_SETTLE_USEC 10000
+
+gboolean
+gdix51c0_cmd_ack_maybe_resp (Gdix51c0Bus *bus,
+                             const guint8 *payload,
+                             gsize len,
+                             guint timeout_usec,
+                             const char *label,
+                             GError **error)
+{
+  g_autofree guint8 *response = NULL;
+  gsize response_len = 0;
+
+  if (!(proto_quirks & GDIX51C0_QUIRK_EXTRA_ACKS))
+    {
+      response = gdix51c0_cmd_ack_resp_same_irq (bus, payload, len, timeout_usec,
+                                                 &response_len, label, error);
+      return response != NULL;
+    }
+
+  if (!gdix51c0_cmd_send_and_ack (bus, payload, len, FALSE, label, error))
+    return FALSE;
+
+  if (gdix51c0_irq_wait (bus->irq_req, bus->irq_events, FALSE, bus->irq_offset,
+                         GDIX51C0_ACK_ONLY_SETTLE_USEC, label, NULL))
+    {
+      fp_dbg ("gdix51c0: %s: ACK only, no response pending", label);
+      return TRUE;
+    }
+
+  response = gdix51c0_spi_read (bus->dev, bus->spi_fd, &response_len, error);
+  if (!response)
+    return FALSE;
+  if (response_len == 0 || response[0] != payload[0])
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                   "gdix51c0: %s expected response 0x%02x, got 0x%02x (%zu B)",
+                   label, payload[0], response_len > 0 ? response[0] : 0,
+                   response_len);
+      return FALSE;
+    }
+  fp_dbg ("gdix51c0: %s response read %zu B", label, response_len);
+  return gdix51c0_irq_wait (bus->irq_req, bus->irq_events, FALSE,
+                            bus->irq_offset,
+                            MAX (timeout_usec, GDIX51C0_CMD_MIN_RESPONSE_TIMEOUT_USEC),
+                            label, error);
+}
+
+/* F4 compares CRC32/MPEG-2 (poly 0x04c11db7, init 0xffffffff, no xorout) of any
+ * memory range with a caller value and answers equal or not equal. On
+ * GF_HC460SEC_APP_1410x it is the only way to read memory (F2 is not
+ * implemented), so bytes are read one at a time: the CRC of a single byte is
+ * unique per value, so at most 256 queries recover it. */
+#define GDIX51C0_CRC_ORACLE_ATTEMPTS 4
+
+static guint32
+gdix51c0_crc_one_byte (guint8 value)
+{
+  guint32 c = (guint32) (0xffu ^ value) << 24;
+
+  for (int i = 0; i < 8; i++)
+    c = (c & 0x80000000u) ? (c << 1) ^ 0x04c11db7u : (c << 1);
+  return 0xffffff00u ^ c;
+}
+
+static gboolean
+gdix51c0_crc_oracle_query (Gdix51c0Bus *bus, guint32 addr, guint32 crc,
+                           gboolean *equal, GError **error)
+{
+  guint8 pkt[16] = { 0xf4, 0x0d, 0x00 };
+
+  memcpy (pkt + 3, (guint32[]) { GUINT32_TO_LE (addr) }, 4);
+  memcpy (pkt + 7, (guint32[]) { GUINT32_TO_LE (1) }, 4);
+  memcpy (pkt + 11, (guint32[]) { GUINT32_TO_LE (crc) }, 4);
+  pkt[15] = gdix51c0_payload_checksum (pkt, 15);
+
+  for (guint attempt = 1; ; attempt++)
+    {
+      g_autoptr(GError) local_error = NULL;
+      g_autofree guint8 *ack = NULL, *resp = NULL;
+      gsize ack_len = 0, resp_len = 0;
+
+      gdix51c0_cmd_prepare_send (bus);
+      if (gdix51c0_spi_write (bus->dev, bus->spi_fd, GDIX51C0_PKT_WRITE,
+                              pkt, sizeof pkt, &local_error) &&
+          gdix51c0_irq_wait (bus->irq_req, bus->irq_events, TRUE, bus->irq_offset,
+                             GDIX51C0_CMD_ACK_TIMEOUT_USEC, "crc-oracle", &local_error) &&
+          (ack = gdix51c0_spi_read (bus->dev, bus->spi_fd, &ack_len, &local_error)) &&
+          (resp = gdix51c0_spi_read (bus->dev, bus->spi_fd, &resp_len, &local_error)))
+        {
+          if (resp_len >= 4 && resp[0] == 0xf4)
+            {
+              *equal = resp[3] == 1;
+              gdix51c0_irq_wait (bus->irq_req, bus->irq_events, FALSE,
+                                 bus->irq_offset, GDIX51C0_CMD_ACK_TIMEOUT_USEC,
+                                 "crc-oracle", NULL);
+              return TRUE;
+            }
+          g_set_error (&local_error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                       "gdix51c0: crc-oracle: unexpected reply 0x%02x (%zu B)",
+                       resp_len ? resp[0] : 0, resp_len);
+        }
+
+      if (attempt == GDIX51C0_CRC_ORACLE_ATTEMPTS)
+        {
+          g_propagate_error (error, g_steal_pointer (&local_error));
+          return FALSE;
+        }
+      /* A lost exchange: let the sensor settle and drop anything pending. */
+      g_usleep (50000 * attempt);
+      gdix51c0_spi_drain (bus->spi_fd);
+    }
+}
+
+gboolean
+gdix51c0_crc_oracle_read (Gdix51c0Bus *bus, guint32 addr, guint8 *out,
+                          gsize len, GError **error)
+{
+  for (gsize i = 0; i < len; i++)
+    {
+      gboolean found = FALSE;
+
+      for (guint v = 0; v < 256 && !found; v++)
+        {
+          gboolean equal = FALSE;
+
+          if (!gdix51c0_crc_oracle_query (bus, addr + i, gdix51c0_crc_one_byte (v),
+                                          &equal, error))
+            return FALSE;
+          if (equal)
+            {
+              out[i] = (guint8) v;
+              found = TRUE;
+            }
+        }
+      if (!found)
+        {
+          g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                       "gdix51c0: crc-oracle: no byte value matched at 0x%08x",
+                       addr + (guint32) i);
+          return FALSE;
+        }
+    }
+  return TRUE;
 }
 
 gboolean
@@ -1203,6 +1561,16 @@ gdix51c0_provision_psk (Gdix51c0Bus *bus,
       }
     dtype = resp[4] | (resp[5] << 8) | (resp[6] << 16) | ((guint32) resp[7] << 24);
     dlen = resp[8] | (resp[9] << 8) | (resp[10] << 16) | ((guint32) resp[11] << 24);
+    /* fw 14103 tags the 32-byte hash 0x0000aaaa instead of echoing the
+     * address; the hash comparison below still decides. */
+    if ((proto_quirks & GDIX51C0_QUIRK_EXTRA_ACKS) && resp[3] == 0 &&
+        dtype == GDIX51C0_PSK_HASH_TAG_14103 && dlen == 32 &&
+        (gsize) 12 + dlen + 1 <= resp_len)
+      {
+        fp_info ("gdix51c0: provision verify: 0x%08x-tagged hash %s SHA-256 of WB",
+                 dtype, memcmp (resp + 12, want, 32) == 0 ? "matches" : "differs from");
+        dtype = GDIX51C0_PSK_HASH_ADDR;
+      }
     if (resp[3] != 0 || dtype != GDIX51C0_PSK_HASH_ADDR || dlen != 32 ||
         (gsize) 12 + dlen + 1 > resp_len)
       {

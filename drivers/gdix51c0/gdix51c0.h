@@ -94,7 +94,29 @@ G_DECLARE_FINAL_TYPE (FpiDeviceGdix51c0, fpi_device_gdix51c0, FPI, DEVICE_GDIX51
 
 #define GDIX51C0_UDEV_TYPES FPI_DEVICE_UDEV_SUBTYPE_SPIDEV
 
+/* id_table driver_data flags */
+#define GDIX51C0_QUIRK_LEVEL_IRQ  (1 << 0) /* IRQ pad reports level, not edges */
+#define GDIX51C0_QUIRK_EXTRA_ACKS (1 << 1) /* fw ACKs 0xd5 and single-response cmds */
+#define GDIX51C0_QUIRK_SLOW_TURNAROUND (1 << 2) /* needs read->write gap, slow replies */
+#define GDIX51C0_QUIRK_FACTORY_PMK (1 << 3) /* PSK is the factory PMK; 0xe0 is a no-op */
+#define GDIX51C0_QUIRK_CONFIG_256  (1 << 4) /* sensor config is a 256-byte 0x90 block */
+#define GDIX51C0_QUIRK_PADDED_FRAME (1 << 5) /* image rows are 88 samples, 64 real */
+
+/* Padded image format: 80 rows of 88 raw12 samples, the first 64 of each real. */
+#define GDIX51C0_PADDED_ROW_STRIDE  88
+#define GDIX51C0_PADDED_FRAME_BYTES (GDIX51C0_PADDED_ROW_STRIDE * GDIX51C0_SENSOR_HEIGHT * 3 / 2)
+
+/* Cached factory PMK (48 bytes, root 0600), read from the sensor once via F4. */
+#define GDIX51C0_DEFAULT_PMK_CACHE_FILE "/var/lib/fprint/gdix51c0-pmk.bin"
+
 static const FpIdEntry gdix51c0_id_table[] = {
   { .udev_types = GDIX51C0_UDEV_TYPES, .spi_acpi_id = "GDIX51C0" },
+  /* Same ChicagoHS die behind an HC32F460 MCU on some Huawei/Honor boards
+   * (e.g. BOHB-WAX9, fw GF_HC460SEC_APP_14103). GPIO lines differ per board,
+   * and firmware locks the IRQ pad as level-triggered. */
+  { .udev_types = GDIX51C0_UDEV_TYPES, .spi_acpi_id = "GXFP51A0",
+    .driver_data = GDIX51C0_QUIRK_LEVEL_IRQ | GDIX51C0_QUIRK_EXTRA_ACKS |
+                   GDIX51C0_QUIRK_SLOW_TURNAROUND | GDIX51C0_QUIRK_FACTORY_PMK |
+                   GDIX51C0_QUIRK_CONFIG_256 | GDIX51C0_QUIRK_PADDED_FRAME },
   { .udev_types = 0 }
 };
